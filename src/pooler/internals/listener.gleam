@@ -1,10 +1,16 @@
+import gleam/option
 import gleam/otp/actor
 import gleam/otp/supervision
+import pooler/internals/files
 import pooler/socket
 import relay_supervisor as relay
 
 pub type Argument {
-  Argument(address: Address, active_state: socket.ActiveState)
+  Argument(
+    address: Address,
+    tls: option.Option(socket.CertificateKey),
+    active_state: socket.ActiveState,
+  )
 }
 
 pub type Address {
@@ -25,15 +31,21 @@ fn start(argument: Argument) {
       Unix(path:) -> #(0, socket.Local(path))
     }
 
-    let listen =
-      socket.listen(port, [
-        socket.BindAddress(interface),
-        socket.Active(argument.active_state),
-      ])
+    let tcp_options = [
+      socket.BindAddress(interface),
+      socket.Active(argument.active_state),
+    ]
+
+    let listen = case argument.tls {
+      option.Some(certificate_key) -> {
+        let tls_options = [socket.CertificateKeys([certificate_key])]
+        socket.listen_tls(port, tcp_options, tls_options)
+      }
+      option.None -> socket.listen(port, tcp_options)
+    }
 
     case listen {
       Ok(opened) -> {
-        let _ = echo socket.sockname_listener(opened.0, opened.1)
         actor.initialised(Nil)
         |> actor.returning(opened)
         |> Ok
@@ -68,9 +80,10 @@ pub fn socket_path_error_to_string(error: SocketPathError) -> String {
       <> path_kind_to_string(kind)
       <> " rather than a socket, so it was left untouched"
     PathNotInspected(reason:) ->
-      "the path could not be inspected, " <> file_reason_to_string(reason)
+      "the path could not be inspected, " <> files.reason_to_string(reason)
     PathNotRemoved(reason:) ->
-      "the stale socket could not be removed, " <> file_reason_to_string(reason)
+      "the stale socket could not be removed, "
+      <> files.reason_to_string(reason)
   }
 }
 
@@ -81,23 +94,6 @@ fn path_kind_to_string(kind: PathKind) -> String {
     Regular -> "a regular file"
     Symlink -> "a symbolic link"
     UnknownKind -> "a file of a kind these bindings do not name"
-  }
-}
-
-fn file_reason_to_string(reason: String) -> String {
-  case reason {
-    "eacces" -> "permission was denied"
-    "eperm" -> "the operation is not permitted"
-    "eisdir" -> "the path is a directory"
-    "enotdir" -> "a component of the path is not a directory"
-    "eloop" -> "too many symbolic links were followed"
-    "enametoolong" -> "the path is too long"
-    "erofs" -> "the file system is read only"
-    "ebusy" -> "the file is in use"
-    "enomem" -> "the system ran out of memory"
-    "enoent" -> "no such file or directory"
-    "badarg" -> "the path is not a usable file name"
-    other_reason -> "the file system reported " <> other_reason
   }
 }
 

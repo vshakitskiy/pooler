@@ -1,5 +1,7 @@
 -module(pooler_socket_ffi).
 
+-include_lib("public_key/include/public_key.hrl").
+
 -export([tcp_listen/2, tcp_accept/2, tcp_controlling_process/2, tcp_close/1,
          tcp_shutdown/2, tcp_send/2, tcp_receive/3, tcp_set_options/2,
          tcp_sockname/1, tcp_peername/1,
@@ -7,7 +9,8 @@
          ssl_controlling_process/2, ssl_close/1, ssl_shutdown/2, ssl_send/2,
          ssl_receive/3, ssl_set_options/2, ssl_sockname/1, ssl_peername/1,
          ssl_negotiated_protocol/1, ssl_peer_certificate/1,
-         certificates_from_pem/1, private_key_from_pem/1,
+         certificates_from_pem/1, private_key_from_pem/2,
+         system_certificate_authorities/0,
          message/1, reason/1]).
 
 -define(FIXED_OPTIONS, [binary, {packet, raw}]).
@@ -83,25 +86,37 @@ ssl_negotiated_protocol(Socket) ->
 ssl_peer_certificate(Socket) ->
     outcome(ssl:peercert(Socket)).
 
+system_certificate_authorities() ->
+    [Der || #cert{der = Der} <- public_key:cacerts_get()].
+
 certificates_from_pem(Pem) ->
     [Der || {'Certificate', Der, not_encrypted} <- public_key:pem_decode(Pem)].
 
-private_key_from_pem(Pem) ->
+private_key_from_pem(Pem, Password) ->
     private_key_entry([Entry
                        || Entry <- public_key:pem_decode(Pem),
-                          is_private_key(Entry)]).
+                          is_private_key(Entry)],
+                      Password).
 
 is_private_key({Type, _Der, _Cipher}) ->
     lists:member(Type,
                  ['RSAPrivateKey', 'DSAPrivateKey', 'ECPrivateKey',
                   'PrivateKeyInfo']).
 
-private_key_entry([]) -> {error, no_private_key};
-private_key_entry([{_Type, _Der, Cipher} | _Rest])
-  when Cipher =/= not_encrypted ->
+private_key_entry([], _Password) ->
+    {error, no_private_key};
+private_key_entry([{Type, Der, not_encrypted} | _Rest], _Password) ->
+    {ok, private_key(Type, Der)};
+private_key_entry([_Entry | _Rest], none) ->
     {error, encrypted_private_key};
-private_key_entry([{Type, Der, not_encrypted} | _Rest]) ->
-    {ok, private_key(Type, Der)}.
+private_key_entry([Entry | _Rest], {some, Password}) ->
+    try public_key:pem_entry_decode(Entry, binary_to_list(Password)) of
+        Decoded ->
+            Type = element(1, Decoded),
+            {ok, private_key(Type, public_key:der_encode(Type, Decoded))}
+    catch
+        _Class:_Reason -> {error, wrong_password}
+    end.
 
 private_key('RSAPrivateKey', Der) -> {rsa_private_key, Der};
 private_key('DSAPrivateKey', Der) -> {dsa_private_key, Der};
@@ -164,7 +179,37 @@ reason(etimedout) -> etimedout;
 reason(ewouldblock) -> ewouldblock;
 reason(exbadport) -> exbadport;
 reason(exbadseq) -> exbadseq;
+reason(nooptions) ->
+    {bad_tls_option, <<"certs_keys">>, <<"no certificate was given">>};
+reason({option, client_only, Option}) ->
+    {bad_tls_option,
+     atom_to_binary(Option, utf8),
+     <<"it is a client option and does nothing on a listen socket">>};
+reason({options, incompatible, Options}) ->
+    {bad_tls_option, <<"verify">>, text("~p cannot be combined", [Options])};
+reason({options, {Option, {Path, Problem}}})
+  when is_list(Path); is_binary(Path) ->
+    {bad_tls_option, atom_to_binary(Option, utf8), file_problem(Path, Problem)};
+reason({options, {Option, Value}}) when is_atom(Option) ->
+    {bad_tls_option, atom_to_binary(Option, utf8), text("~p was refused", [Value])};
+reason({options, Value}) ->
+    {bad_tls_option, <<"options">>, text("~p was refused", [Value])};
 reason(Reason) -> failure(Reason).
+
+file_problem(Path, enoent) ->
+    text("~ts does not exist", [Path]);
+file_problem(Path, eacces) ->
+    text("~ts could not be read, permission was denied", [Path]);
+file_problem(Path, no_certs) ->
+    text("~ts holds no certificate", [Path]);
+file_problem(Path, wrong_password) ->
+    text("~ts is encrypted and the password given does not decrypt it",
+         [Path]);
+file_problem(Path, Problem) ->
+    text("~ts was refused, ~p", [Path, Problem]).
+
+text(Format, Arguments) ->
+    unicode:characters_to_binary(io_lib:format(Format, Arguments)).
 
 alert(close_notify) -> close_notify;
 alert(unexpected_message) -> unexpected_message;
@@ -265,18 +310,29 @@ tls_options(Options) ->
 
 tls_option({certificate_keys, Entries}) ->
     {certs_keys, [certificate_key(Entry) || Entry <- Entries]};
+tls_option({server_name_certificates, Hosts}) ->
+    {sni_hosts,
+     [{binary_to_list(Host), [{certs_keys, [certificate_key(Entry)]}]}
+      || {Host, Entry} <- Hosts]};
 tls_option({certificate_authority_file, Path}) -> {cacertfile, Path};
 tls_option({certificate_authorities, Certificates}) -> {cacerts, Certificates};
+tls_option({send_certificate_authorities, Enabled}) ->
+    {certificate_authorities, Enabled};
 tls_option({verify, Mode}) -> {verify, Mode};
 tls_option({fail_without_peer_certificate, Enabled}) ->
     {fail_if_no_peer_cert, Enabled};
 tls_option({depth, Depth}) -> {depth, Depth};
+tls_option({crl_check, Mode}) -> {crl_check, crl_mode(Mode)};
 tls_option({versions, Versions}) ->
     {versions, [tls_version(Version) || Version <- Versions]};
+tls_option({supported_groups, Groups}) ->
+    {supported_groups, [key_exchange_group(Group) || Group <- Groups]};
 tls_option({alpn_preferred_protocols, Protocols}) ->
     {alpn_preferred_protocols, Protocols};
 tls_option({honor_cipher_order, Enabled}) -> {honor_cipher_order, Enabled};
 tls_option({reuse_sessions, Enabled}) -> {reuse_sessions, Enabled};
+tls_option({secure_renegotiate, Enabled}) -> {secure_renegotiate, Enabled};
+tls_option({client_renegotiation, Enabled}) -> {client_renegotiation, Enabled};
 tls_option({session_tickets, Mode}) -> {session_tickets, ticket_mode(Mode)};
 tls_option({diffie_hellman_file, Path}) -> {dhfile, Path};
 tls_option({hibernate_after, Milliseconds}) -> {hibernate_after, Milliseconds};
@@ -298,6 +354,22 @@ from_private_key({private_key_info, Der}) -> {'PrivateKeyInfo', Der}.
 
 tls_version(tls13) -> 'tlsv1.3';
 tls_version(tls12) -> 'tlsv1.2'.
+
+crl_mode(crl_disabled) -> false;
+crl_mode(crl_whole_chain) -> true;
+crl_mode(crl_peer_only) -> peer;
+crl_mode(crl_best_effort) -> best_effort.
+
+key_exchange_group(x25519) -> x25519;
+key_exchange_group(x448) -> x448;
+key_exchange_group(secp256r1) -> secp256r1;
+key_exchange_group(secp384r1) -> secp384r1;
+key_exchange_group(secp521r1) -> secp521r1;
+key_exchange_group(ffdhe2048) -> ffdhe2048;
+key_exchange_group(ffdhe3072) -> ffdhe3072;
+key_exchange_group(ffdhe4096) -> ffdhe4096;
+key_exchange_group(ffdhe6144) -> ffdhe6144;
+key_exchange_group(ffdhe8192) -> ffdhe8192.
 
 ticket_mode(tickets_disabled) -> disabled;
 ticket_mode(stateful) -> stateful;

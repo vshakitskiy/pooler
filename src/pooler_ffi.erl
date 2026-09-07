@@ -2,7 +2,7 @@
 
 -include_lib("kernel/include/file.hrl").
 
--export([parse_address/1, unlink_stale_socket/1]).
+-export([parse_address/1, unlink_stale_socket/1, read_file/1]).
 
 parse_address(Address) ->
   case inet:parse_address(binary_to_list(Address)) of
@@ -12,6 +12,12 @@ parse_address(Address) ->
       {ok, {ipv6, A, B, C, D, E, F, G, H}};
     {error, einval} ->
       {error, nil}
+  end.
+
+read_file(Path) ->
+  case file:read_file(Path) of
+    {ok, Bytes} -> {ok, Bytes};
+    {error, Reason} -> {error, reason(Reason)}
   end.
 
 unlink_stale_socket(Path) ->

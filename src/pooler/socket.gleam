@@ -81,6 +81,10 @@ pub type SocketError {
   /// A TLS alert sent by the peer or raised locally. `detail` is Erlang's
   /// description of it.
   TlsAlert(description: AlertDescription, detail: String)
+  /// A `TlsOption` was rejected before the socket was opened. `option` names
+  /// the Erlang option and `detail` says what was wrong with it. Always a
+  /// configuration mistake rather than a runtime condition.
+  BadTlsOption(option: String, detail: String)
   /// Permission denied.
   Eacces
   /// The address and port are already bound by another socket.
@@ -247,7 +251,8 @@ pub type Interface {
   Any
   /// The loopback interface only.
   Loopback
-  // Unix address.
+  /// The path of a Unix domain socket. `port` has to be `0` and the socket
+  /// has to be in the `Local` family.
   Local(String)
 }
 
@@ -332,6 +337,47 @@ pub type TlsVersion {
   Tls12
 }
 
+/// Whether the peer's certificate is checked against a certificate
+/// revocation list. Only meaningful alongside `Verify(VerifyPeer)`.
+pub type CrlMode {
+  /// No revocation check.
+  CrlDisabled
+  /// Check every certificate in the chain. A list that cannot be fetched
+  /// fails the connection.
+  CrlWholeChain
+  /// Check the peer's own certificate and no issuer above it.
+  CrlPeerOnly
+  /// Check what can be checked. A list that cannot be fetched is not a
+  /// failure.
+  CrlBestEffort
+}
+
+/// A group the key exchange may use, either an elliptic curve or a finite
+/// field Diffie-Hellman group from
+/// [RFC 7919](https://www.rfc-editor.org/rfc/rfc7919).
+pub type KeyExchangeGroup {
+  /// Curve25519.
+  X25519
+  /// Curve448.
+  X448
+  /// NIST P-256.
+  Secp256r1
+  /// NIST P-384.
+  Secp384r1
+  /// NIST P-521.
+  Secp521r1
+  /// 2048 bit finite field.
+  Ffdhe2048
+  /// 3072 bit finite field.
+  Ffdhe3072
+  /// 4096 bit finite field.
+  Ffdhe4096
+  /// 6144 bit finite field.
+  Ffdhe6144
+  /// 8192 bit finite field.
+  Ffdhe8192
+}
+
 /// The TLS 1.3 session resumption the server offers.
 pub type TicketMode {
   /// No resumption.
@@ -391,26 +437,42 @@ pub type PrivateKey {
 pub type PemError {
   /// The bytes hold no private key.
   NoPrivateKey
-  /// The key is encrypted. It has to be decrypted before it is used here.
+  /// The key is encrypted and no password was given.
   EncryptedPrivateKey
+  /// The key is encrypted and the password given does not decrypt it.
+  WrongPassword
 }
 
 /// The TLS options a listener takes alongside its `TcpOption`s.
 pub type TlsOption {
-  /// The server's own certificates and keys.
+  /// The server's own certificates and keys. An empty list opens a socket
+  /// that accepts connections and then fails every handshake, so give at
+  /// least one entry.
   CertificateKeys(List(CertificateKey))
+  /// A certificate to serve in place of `CertificateKeys` when the client
+  /// asks for a particular name through SNI, keyed by that name.
+  ServerNameCertificates(List(#(String, CertificateKey)))
   /// A PEM file of trusted certificate authorities.
   CertificateAuthorityFile(String)
   /// Trusted certificate authorities as DER certificates.
   CertificateAuthorities(List(BitArray))
+  /// Whether the server tells the client which authorities it accepts while
+  /// asking for a certificate. Distinct from `CertificateAuthorities`, which
+  /// is the set the server itself trusts. TLS 1.3 only.
+  SendCertificateAuthorities(Bool)
   /// Whether the client's certificate is checked.
   Verify(VerifyMode)
   /// With `VerifyPeer`, reject a client that sends no certificate.
   FailWithoutPeerCertificate(Bool)
   /// How many intermediate certificates a chain may have.
   Depth(Int)
+  /// Whether a checked certificate is also tested against a revocation list.
+  CrlCheck(CrlMode)
   /// The protocol versions the server accepts.
   Versions(List(TlsVersion))
+  /// The groups the key exchange may use, most preferred first. TLS 1.3 and
+  /// the TLS 1.2 elliptic curve exchanges.
+  SupportedGroups(List(KeyExchangeGroup))
   /// The protocols the server picks from the client's list, most preferred
   /// first.
   AlpnPreferredProtocols(List(BitArray))
@@ -418,6 +480,12 @@ pub type TlsOption {
   HonorCipherOrder(Bool)
   /// Allow TLS 1.2 session resumption.
   ReuseSessions(Bool)
+  /// Refuse to renegotiate with a peer that does not support
+  /// [RFC 5746](https://www.rfc-editor.org/rfc/rfc5746). TLS 1.2 and below,
+  /// where renegotiation exists.
+  SecureRenegotiate(Bool)
+  /// Whether a client may ask to renegotiate. TLS 1.2 and below.
+  ClientRenegotiation(Bool)
   /// The TLS 1.3 session resumption offered.
   SessionTickets(TicketMode)
   /// A PEM file of Diffie-Hellman parameters.
@@ -462,6 +530,8 @@ pub fn error_to_string(error: SocketError) -> String {
       <> " ("
       <> detail
       <> ")"
+    BadTlsOption(option:, detail:) ->
+      "the TLS option " <> option <> " was rejected, " <> detail
     Eacces -> "permission was denied"
     Eaddrinuse -> "the address is already bound by another socket"
     Eaddrnotavail -> "the address is not one of this host's"
@@ -551,8 +621,9 @@ pub fn alert_description_to_string(description: AlertDescription) -> String {
 pub fn pem_error_to_string(error: PemError) -> String {
   case error {
     NoPrivateKey -> "the bytes hold no private key"
-    EncryptedPrivateKey ->
-      "the key is encrypted and has to be decrypted before it is used here"
+    EncryptedPrivateKey -> "the key is encrypted and no password was given"
+    WrongPassword ->
+      "the key is encrypted and the password given does not decrypt it"
   }
 }
 
@@ -815,7 +886,18 @@ pub fn certificates_from_pem(pem: BitArray) -> List(BitArray)
 ///
 /// [`public_key:pem_decode/1`](https://www.erlang.org/doc/apps/public_key/public_key.html#pem_decode/1)
 @external(erlang, "pooler_socket_ffi", "private_key_from_pem")
-pub fn private_key_from_pem(pem: BitArray) -> Result(PrivateKey, PemError)
+pub fn private_key_from_pem(
+  pem: BitArray,
+  password: option.Option(String),
+) -> Result(PrivateKey, PemError)
+
+/// The DER certificates of the authorities the operating system trusts as
+/// `CertificateAuthorities` takes them. Raises when the host has no trust
+/// store to read.
+///
+/// [`public_key:cacerts_get/0`](https://www.erlang.org/doc/apps/public_key/public_key.html#cacerts_get/0)
+@external(erlang, "pooler_socket_ffi", "system_certificate_authorities")
+pub fn system_certificate_authorities() -> List(BitArray)
 
 @external(erlang, "pooler_socket_ffi", "tcp_listen")
 fn tcp_listen(
