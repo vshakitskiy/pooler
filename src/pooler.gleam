@@ -15,14 +15,18 @@
 //    ┆                    │
 //    ├─ Acceptor worker N ┘
 
+import gleam/bit_array
+import gleam/list
 import gleam/option
 import gleam/otp/actor
 import gleam/otp/supervision
 import gleam/result
 import gleam/string
 import logging
-import pooler/internals/files
+import pooler/internals/connection
+import pooler/internals/file
 import pooler/internals/listener
+import pooler/internals/pool
 import pooler/socket
 import relay_supervisor as relay
 
@@ -53,7 +57,16 @@ pub fn listening(builder: Builder, on address: Address) {
   Builder(..builder, address:)
 }
 
-pub type Tls {
+pub opaque type Tls {
+  Tls(
+    certificate: Certificate,
+    client_certificates: option.Option(ClientCertificates),
+    alpn: List(String),
+    session_tickets: TicketMode,
+  )
+}
+
+pub type Certificate {
   Disk(cert: String, key: String)
   EncryptedDisk(cert: String, key: String, password: String)
   Pem(cert: BitArray, key: BitArray)
@@ -81,7 +94,54 @@ fn to_internal_key(key: TlsPrivateKey) -> socket.PrivateKey {
   }
 }
 
-pub fn with_tls(builder: Builder, tls: Tls) -> Builder {
+pub fn tls(certificate: Certificate) {
+  Tls(
+    certificate:,
+    client_certificates: option.None,
+    alpn: [],
+    session_tickets: Stateless,
+  )
+}
+
+pub type ClientCertificates {
+  Requested(trusting: TrustStore)
+  Required(trusting: TrustStore)
+}
+
+pub type TrustStore {
+  SystemTrustStore
+  TrustDisk(path: String)
+  TrustPem(bytes: BitArray)
+  TrustDer(certificates: List(BitArray))
+}
+
+pub fn verifying_clients(tls: Tls, on: ClientCertificates) {
+  Tls(..tls, client_certificates: option.Some(on))
+}
+
+pub fn with_alpn(tls: Tls, protocols: List(String)) {
+  Tls(..tls, alpn: protocols)
+}
+
+pub type TicketMode {
+  NoTickets
+  Stateful
+  Stateless
+}
+
+fn to_internal_ticket_mode(mode: TicketMode) -> socket.TicketMode {
+  case mode {
+    NoTickets -> socket.TicketsDisabled
+    Stateful -> socket.Stateful
+    Stateless -> socket.Stateless
+  }
+}
+
+pub fn session_tickets(tls: Tls, mode: TicketMode) {
+  Tls(..tls, session_tickets: mode)
+}
+
+pub fn with_tls(builder: Builder, tls: Tls) {
   Builder(..builder, tls: option.Some(tls))
 }
 
@@ -102,20 +162,17 @@ pub fn start(builder: Builder) {
       Ok(listener.Unix(path:))
     }
   })
-
   use tls <- try_tls(builder.tls)
 
   let listener_argument =
     listener.Argument(address:, tls:, active_state: builder.active_state)
 
-  relay.new(fn(children) { add_listener(children, listener_argument) })
+  relay.new(fn(children) {
+    listener.add_child(children, listener_argument)
+    |> connection.add_child
+    |> pool.add_child(pool_size: builder.pool_size)
+  })
   |> relay.start
-}
-
-fn add_listener(children: relay.Children(Nil), argument: listener.Argument) {
-  relay.child(listener.template())
-  |> relay.providing(fn(_nil) { argument })
-  |> relay.add(children, _)
 }
 
 fn try_port(
@@ -166,47 +223,97 @@ fn try_unix_path(
   }
 }
 
+const default_tls_options = [
+  socket.Versions([socket.Tls12, socket.Tls13]),
+  socket.HonorCipherOrder(True),
+  socket.ClientRenegotiation(False),
+]
+
 fn try_tls(
   tls: option.Option(Tls),
-  callback: fn(option.Option(socket.CertificateKey)) ->
+  callback: fn(option.Option(List(socket.TlsOption))) ->
     Result(a, actor.StartError),
-) -> Result(a, actor.StartError) {
+) {
   case tls {
-    option.Some(Disk(cert:, key:)) -> try_disk(cert, key, option.None, callback)
-    option.Some(EncryptedDisk(cert:, key:, password:)) ->
-      try_disk(cert, key, option.Some(password), callback)
-    option.Some(Pem(cert:, key:)) -> try_pem(cert, key, option.None, callback)
-    option.Some(EncryptedPem(cert:, key:, password:)) ->
-      try_pem(cert, key, option.Some(password), callback)
-    option.Some(Der(chain:, key:)) -> try_der(chain, key, callback)
+    option.Some(Tls(certificate:, client_certificates:, alpn:, session_tickets:)) -> {
+      use certificate <- try_certificate(certificate)
+      use client_certificates <- try_client_certificates(client_certificates)
+      use alpn <- try_alpn(alpn)
+
+      let tls_options = [
+        socket.CertificateKeys([certificate]),
+        socket.SessionTickets(to_internal_ticket_mode(session_tickets)),
+        ..client_certificates
+      ]
+
+      let tls_options = case alpn {
+        [] -> tls_options
+        alpn -> [socket.AlpnPreferredProtocols(alpn), ..tls_options]
+      }
+
+      callback(option.Some(list.append(default_tls_options, tls_options)))
+    }
     option.None -> callback(option.None)
   }
 }
 
-fn try_disk(
+fn try_alpn(
+  alpn: List(String),
+  callback: fn(List(BitArray)) -> Result(a, actor.StartError),
+) -> Result(a, actor.StartError) {
+  list.unique(alpn)
+  |> list.try_map(with: fn(protocol) {
+    case protocol, string.byte_size(protocol) {
+      "", _ -> Error(actor.InitFailed("Empty ALPN protocol provided."))
+      _, length if length > 255 ->
+        Error(actor.InitFailed(
+          "\"" <> protocol <> "\" ALPN protocol exceeded 255 byte limit.",
+        ))
+      _, _ -> Ok(bit_array.from_string(protocol))
+    }
+  })
+  |> result.try(callback)
+}
+
+fn try_certificate(
+  tls: Certificate,
+  callback: fn(socket.CertificateKey) -> Result(a, actor.StartError),
+) -> Result(a, actor.StartError) {
+  case tls {
+    Disk(cert:, key:) -> try_disk_certificate(cert, key, option.None, callback)
+    EncryptedDisk(cert:, key:, password:) ->
+      try_disk_certificate(cert, key, option.Some(password), callback)
+    Pem(cert:, key:) -> try_pem_certificate(cert, key, option.None, callback)
+    EncryptedPem(cert:, key:, password:) ->
+      try_pem_certificate(cert, key, option.Some(password), callback)
+    Der(chain:, key:) -> try_der_certificate(chain, key, callback)
+  }
+}
+
+fn try_disk_certificate(
   certificate_file: String,
   key_file: String,
   password: option.Option(String),
-  callback: fn(option.Option(socket.CertificateKey)) ->
-    Result(a, actor.StartError),
+  callback: fn(socket.CertificateKey) -> Result(a, actor.StartError),
 ) -> Result(a, actor.StartError) {
   use certificate <- try_read(certificate_file)
   use key <- try_read(key_file)
-  try_pem(certificate, key, password, callback)
+
+  try_pem_certificate(certificate, key, password, callback)
 }
 
 fn try_read(
   path: String,
   callback: fn(BitArray) -> Result(a, actor.StartError),
 ) -> Result(a, actor.StartError) {
-  case files.read(path) {
+  case file.read(path) {
     Ok(bytes) -> callback(bytes)
     Error(reason) ->
       Error(actor.InitFailed(
         "Could not read "
         <> path
         <> ": "
-        <> files.reason_to_string(reason)
+        <> file.reason_to_string(reason)
         <> ".",
       ))
   }
@@ -214,18 +321,17 @@ fn try_read(
 
 const no_certificate = "No certificate was given. A listener with no certificate accepts connections and then fails every handshake."
 
-fn try_pem(
+fn try_pem_certificate(
   cert: BitArray,
   key: BitArray,
   password: option.Option(String),
-  callback: fn(option.Option(socket.CertificateKey)) ->
-    Result(a, actor.StartError),
+  callback: fn(socket.CertificateKey) -> Result(a, actor.StartError),
 ) -> Result(a, actor.StartError) {
   case socket.certificates_from_pem(cert) {
     [] -> Error(actor.InitFailed(no_certificate))
     chain ->
       case socket.private_key_from_pem(key, password) {
-        Ok(key) -> callback(option.Some(socket.CertificateChain(chain:, key:)))
+        Ok(key) -> callback(socket.CertificateChain(chain:, key:))
         Error(pem_error) ->
           Error(actor.InitFailed(
             "Could not read the private key: "
@@ -236,17 +342,71 @@ fn try_pem(
   }
 }
 
-fn try_der(
+fn try_der_certificate(
   chain: List(BitArray),
   key: TlsPrivateKey,
-  callback: fn(option.Option(socket.CertificateKey)) ->
-    Result(a, actor.StartError),
+  callback: fn(socket.CertificateKey) -> Result(a, actor.StartError),
 ) -> Result(a, actor.StartError) {
   case chain {
     [] -> Error(actor.InitFailed(no_certificate))
     chain ->
-      socket.CertificateChain(chain:, key: to_internal_key(key))
-      |> option.Some
-      |> callback
+      callback(socket.CertificateChain(chain:, key: to_internal_key(key)))
+  }
+}
+
+fn try_client_certificates(
+  client_certificates: option.Option(ClientCertificates),
+  callback: fn(List(socket.TlsOption)) -> Result(a, actor.StartError),
+) -> Result(a, actor.StartError) {
+  case client_certificates {
+    option.Some(Requested(trusting:)) ->
+      try_trust_store(trusting, False, callback)
+    option.Some(Required(trusting:)) ->
+      try_trust_store(trusting, True, callback)
+    option.None -> callback([])
+  }
+}
+
+const no_trust_store = "The trust store holds no certificate. There is no authority to check client certificates against, so every client would be rejected."
+
+fn try_trust_store(
+  store: TrustStore,
+  required: Bool,
+  callback: fn(List(socket.TlsOption)) -> Result(a, actor.StartError),
+) -> Result(a, actor.StartError) {
+  let options = [
+    socket.Verify(socket.VerifyPeer),
+    socket.FailWithoutPeerCertificate(required),
+  ]
+
+  case store {
+    SystemTrustStore -> {
+      let authorities =
+        socket.CertificateAuthorities(socket.system_certificate_authorities())
+      callback([authorities, ..options])
+    }
+    TrustDisk(path:) -> {
+      use bytes <- try_read(path)
+      try_pem_trust_store(bytes, options, callback)
+    }
+    TrustPem(bytes:) -> try_pem_trust_store(bytes, options, callback)
+    TrustDer(certificates:) ->
+      case certificates {
+        [] -> Error(actor.InitFailed(no_trust_store))
+        certificates ->
+          callback([socket.CertificateAuthorities(certificates), ..options])
+      }
+  }
+}
+
+fn try_pem_trust_store(
+  bytes: BitArray,
+  options: List(socket.TlsOption),
+  callback: fn(List(socket.TlsOption)) -> Result(a, actor.StartError),
+) {
+  case socket.certificates_from_pem(bytes) {
+    [] -> Error(actor.InitFailed(no_trust_store))
+    certificates ->
+      callback([socket.CertificateAuthorities(certificates), ..options])
   }
 }

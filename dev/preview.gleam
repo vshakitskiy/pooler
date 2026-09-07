@@ -1,3 +1,4 @@
+import gleam/erlang/process
 import gleam/io
 import logging
 import pooler
@@ -5,11 +6,11 @@ import pooler
 pub fn main() -> Nil {
   logging.configure()
 
-  let _ =
-    pooler.new()
-    |> pooler.listening(on: pooler.Unix(path: "/tmp/pooler.sock"))
+  echo pooler.new()
+    |> pooler.listening(on: pooler.Tcp(interface: "127.0.0.1", port: 3000))
     |> pooler.start
-    |> echo
 
   io.println("Hello from pooler!")
+
+  process.sleep_forever()
 }
