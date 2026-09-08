@@ -16,6 +16,7 @@
 //    ├─ Acceptor worker N ┘
 
 import gleam/bit_array
+import gleam/erlang/process
 import gleam/list
 import gleam/option
 import gleam/otp/actor
@@ -30,21 +31,122 @@ import pooler/internals/pool
 import pooler/socket
 import relay_supervisor as relay
 
-pub opaque type Builder {
+pub type Connection(user_message) {
+  Connection(
+    transport: socket.Transport,
+    socket: socket.Socket,
+    self: process.Subject(connection.Message(user_message)),
+  )
+}
+
+fn from_internal_connection(
+  connection: connection.Connection(user_message),
+) -> Connection(user_message) {
+  case connection {
+    connection.Connection(transport:, socket:, self:) ->
+      Connection(transport:, socket:, self:)
+  }
+}
+
+pub opaque type Next(user_state, user_message) {
+  Continue(
+    state: user_state,
+    selector: option.Option(process.Selector(user_message)),
+    active_state: option.Option(socket.ActiveState),
+  )
+  NormalStop
+  AbnormalStop(reason: String)
+}
+
+pub fn continue(state: user_state) {
+  Continue(state:, selector: option.None, active_state: option.None)
+}
+
+pub fn with_selector(
+  next: Next(user_state, user_message),
+  selector: process.Selector(user_message),
+) {
+  case next {
+    Continue(..) as next -> Continue(..next, selector: option.Some(selector))
+    remaining -> remaining
+  }
+}
+
+// TODO: custom active state type.
+pub fn with_active_state(
+  next: Next(user_state, user_message),
+  active_state: socket.ActiveState,
+) {
+  case next {
+    Continue(..) as next ->
+      Continue(..next, active_state: option.Some(active_state))
+    remaining -> remaining
+  }
+}
+
+fn to_internal_next(
+  next: Next(user_state, user_message),
+) -> connection.Next(user_state, user_message) {
+  case next {
+    Continue(state:, selector:, active_state:) ->
+      connection.Continue(state:, selector:, active_state:)
+    NormalStop -> connection.NormalStop
+    AbnormalStop(reason:) -> connection.AbnormalStop(reason:)
+  }
+}
+
+pub type Message(user_message) {
+  Incoming(BitArray)
+  User(user_message)
+}
+
+fn from_internal_message(
+  message: connection.HandlerMessage(user_message),
+) -> Message(user_message) {
+  case message {
+    connection.Incoming(data) -> Incoming(data)
+    connection.UserMessage(message) -> User(message)
+  }
+}
+
+pub opaque type Builder(user_state, user_message) {
   Builder(
     address: Address,
     tls: option.Option(Tls),
     active_state: socket.ActiveState,
     pool_size: Int,
+    handlers: connection.Handlers(user_state, user_message),
   )
 }
 
-pub fn new() -> Builder {
+pub fn new(
+  on_init on_init: fn(Connection(user_message), process.Selector(user_message)) ->
+    #(user_state, process.Selector(user_message)),
+  handler handler: fn(
+    Connection(user_message),
+    user_state,
+    Message(user_message),
+  ) -> Next(user_state, user_message),
+  on_close on_close: fn(user_state) -> Nil,
+) -> Builder(user_state, user_message) {
   Builder(
     address: Tcp(interface: "127.0.0.1", port: 3000),
     tls: option.None,
     active_state: socket.Once,
     pool_size: 20,
+    handlers: connection.Handlers(
+      on_init: fn(connection, selector) {
+        let connection = from_internal_connection(connection)
+        on_init(connection, selector)
+      },
+      handler: fn(connection, state, message) {
+        let connection = from_internal_connection(connection)
+        let message = from_internal_message(message)
+        handler(connection, state, message)
+        |> to_internal_next
+      },
+      on_close:,
+    ),
   )
 }
 
@@ -53,7 +155,10 @@ pub type Address {
   Unix(path: String)
 }
 
-pub fn listening(builder: Builder, on address: Address) {
+pub fn listening(
+  builder: Builder(user_state, user_message),
+  on address: Address,
+) {
   Builder(..builder, address:)
 }
 
@@ -141,16 +246,16 @@ pub fn session_tickets(tls: Tls, mode: TicketMode) {
   Tls(..tls, session_tickets: mode)
 }
 
-pub fn with_tls(builder: Builder, tls: Tls) {
+pub fn with_tls(builder: Builder(user_state, user_message), tls: Tls) {
   Builder(..builder, tls: option.Some(tls))
 }
 
-pub fn supervised(builder: Builder) {
+pub fn supervised(builder: Builder(user_state, user_message)) {
   use <- supervision.supervisor
   start(builder)
 }
 
-pub fn start(builder: Builder) {
+pub fn start(builder: Builder(user_state, user_message)) {
   use address <- result.try(case builder.address {
     Tcp(interface:, port:) -> {
       use <- try_port(port)
@@ -170,7 +275,7 @@ pub fn start(builder: Builder) {
   relay.new(fn(children) {
     listener.add_child(children, listener_argument)
     |> connection.add_child
-    |> pool.add_child(pool_size: builder.pool_size)
+    |> pool.add_child(pool_size: builder.pool_size, handlers: builder.handlers)
   })
   |> relay.start
 }

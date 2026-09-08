@@ -10,24 +10,29 @@ import pooler/socket
 import relay_supervisor as relay
 
 pub fn add_child(
-  children: relay.Children(connection.Relayed(user_message)),
+  children: relay.Children(connection.Relayed(user_state, user_message)),
   pool_size pool_size: Int,
+  handlers handlers: connection.Handlers(user_state, user_message),
 ) {
   relay.Template(start:, child_type: supervision.Supervisor)
   |> relay.child
-  |> relay.providing(fn(relayed) { #(relayed, pool_size) })
+  |> relay.providing(fn(relayed) { #(relayed, pool_size, handlers) })
   |> relay.returning(fn(_argument, _supervisor) { Nil })
   |> relay.add(children, _)
 }
 
 fn start(
-  argument: #(connection.Relayed(user_message), Int),
+  argument: #(
+    connection.Relayed(user_state, user_message),
+    Int,
+    connection.Handlers(user_state, user_message),
+  ),
 ) -> Result(actor.Started(supervisor.Supervisor), actor.StartError) {
-  let #(relayed, pool_size) = argument
+  let #(relayed, pool_size, handlers) = argument
 
   supervisor.new(supervisor.OneForOne)
   |> int.range(from: 0, to: pool_size, with: _, run: fn(supervisor, _index) {
-    supervision.worker(fn() { start_worker(relayed) })
+    supervision.worker(fn() { start_worker(relayed, handlers) })
     |> supervisor.add(supervisor, _)
   })
   |> supervisor.start
@@ -37,26 +42,38 @@ type Message {
   Accept
 }
 
-type State(user_message) {
+type State(user_state, user_message) {
   State(
     transport: socket.Transport,
     socket: socket.ListenSocket,
     endpoint: socket.Endpoint,
     factory: factory.Supervisor(
-      connection.Argument,
+      connection.Argument(user_state, user_message),
       process.Subject(connection.Message(user_message)),
     ),
     pid: process.Pid,
     self: process.Subject(Message),
+    handlers: connection.Handlers(user_state, user_message),
   )
 }
 
-fn start_worker(relayed: connection.Relayed(user_message)) {
+fn start_worker(
+  relayed: connection.Relayed(user_state, user_message),
+  handlers: connection.Handlers(user_state, user_message),
+) {
   actor.new_with_initialiser(1000, fn(self) {
     process.send(self, Accept)
 
     let connection.Relayed(transport:, socket:, endpoint:, factory:) = relayed
-    State(transport:, socket:, endpoint:, factory:, pid: process.self(), self:)
+    State(
+      transport:,
+      socket:,
+      endpoint:,
+      factory:,
+      pid: process.self(),
+      self:,
+      handlers:,
+    )
     |> actor.initialised
     |> actor.returning(Nil)
     |> Ok
@@ -72,6 +89,7 @@ fn start_worker(relayed: connection.Relayed(user_message)) {
             socket:,
             server: endpoint,
             acceptor: pid,
+            handlers:,
           )
         case factory.start_child(factory, argument) {
           Ok(actor.Started(pid:, data:)) -> {
@@ -112,12 +130,12 @@ fn start_worker(relayed: connection.Relayed(user_message)) {
   |> actor.start
 }
 
-fn loop(state: State(user_message)) {
+fn loop(state: State(user_state, user_message)) {
   process.send(state.self, Accept)
   actor.continue(state)
 }
 
-fn loop_after(state: State(user_message), milliseconds: Int) {
+fn loop_after(state: State(user_state, user_message), milliseconds: Int) {
   process.send_after(state.self, milliseconds, Accept)
   actor.continue(state)
 }
