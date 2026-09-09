@@ -1,12 +1,13 @@
+import exception
 import gleam/erlang/process
 import gleam/option
 import gleam/otp/actor
 import gleam/otp/factory_supervisor as factory
 import gleam/otp/supervision
 import logging
-import pooler/internals/listener
-import pooler/socket
 import relay_supervisor as relay
+import tup/internals/listener
+import tup/socket
 
 pub type Relayed(user_state, user_message) {
   Relayed(
@@ -39,6 +40,7 @@ pub type Argument(user_state, user_message) {
     socket: socket.Socket,
     server: socket.Endpoint,
     acceptor: process.Pid,
+    active_state: socket.ActiveState,
     handlers: Handlers(user_state, user_message),
   )
 }
@@ -128,7 +130,14 @@ type State(user_state, user_message) {
 
 pub fn start_worker(argument: Argument(user_state, user_message)) {
   actor.new_with_initialiser(1000, fn(self) {
-    let Argument(transport:, socket:, server:, acceptor:, handlers:) = argument
+    let Argument(
+      transport:,
+      socket:,
+      server:,
+      acceptor:,
+      active_state:,
+      handlers:,
+    ) = argument
     let monitor = process.monitor(acceptor)
 
     let selector =
@@ -142,7 +151,7 @@ pub fn start_worker(argument: Argument(user_state, user_message)) {
     Initialised(
       transport:,
       socket:,
-      active_state: socket.Once,
+      active_state:,
       self:,
       selector:,
       handlers:,
@@ -237,9 +246,18 @@ pub fn start_worker(argument: Argument(user_state, user_message)) {
         use <- bump_flow_control(transport, socket, active_state)
 
         let connection = Connection(transport:, socket:, self:)
-        // TODO: rescue
-        handlers.handler(connection, user_state, Incoming(data))
-        |> handle_next(state, _)
+        let rescued =
+          exception.rescue(fn() {
+            handlers.handler(connection, user_state, Incoming(data))
+          })
+
+        case rescued {
+          Ok(next) -> handle_next(state, next)
+          Error(exception) -> {
+            handlers.on_close(user_state)
+            actor.stop_abnormal(exception_to_string(exception))
+          }
+        }
       }
       Acknowledged(state:, handlers:, ..), Received(socket.Disconnected) -> {
         handlers.on_close(state)
@@ -261,9 +279,18 @@ pub fn start_worker(argument: Argument(user_state, user_message)) {
         User(message)
       -> {
         let connection = Connection(transport:, socket:, self:)
-        // TODO: rescue
-        handlers.handler(connection, user_state, UserMessage(message))
-        |> handle_next(state, _)
+        let rescued =
+          exception.rescue(fn() {
+            handlers.handler(connection, user_state, UserMessage(message))
+          })
+
+        case rescued {
+          Ok(next) -> handle_next(state, next)
+          Error(exception) -> {
+            handlers.on_close(user_state)
+            actor.stop_abnormal(exception_to_string(exception))
+          }
+        }
       }
       Acknowledged(..), _remaining -> actor.continue(state)
     }
@@ -339,5 +366,16 @@ fn handle_next(
     _, Continue(..) -> actor.continue(state)
     _, NormalStop -> actor.stop()
     _, AbnormalStop(reason:) -> actor.stop_abnormal(reason)
+  }
+}
+
+fn exception_to_string(exception: exception.Exception) {
+  case exception {
+    exception.Errored(_dynamic) ->
+      "An error was raised in the handler. This can be caused by calling the \"echo\", \"panic\", erlang:error/1 function or some other runtime error."
+    exception.Thrown(_dynamic) ->
+      "A value was thrown in the handler. This can be caused by calling the erlang:throw/1 function."
+    exception.Exited(_dynamic) ->
+      "A process exited in the handler. This can be caused by calling the erlang:exit/1 function."
   }
 }

@@ -1,4 +1,4 @@
--module(pooler_socket_ffi).
+-module(tup_socket_ffi).
 
 -include_lib("public_key/include/public_key.hrl").
 

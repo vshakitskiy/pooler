@@ -6,16 +6,22 @@
 // ├─ Connection Supervisor, OneForOne Transient factory_supervisor
 // │  holds the template for handling one accepted connection
 // │  passes socket and a reference to itself
-// └─ Acceptor Pool, OneForOne static_supervisor
-//    │
-//    ├─ Acceptor worker 1 ┐
-//    │                    │ N independent siblings, accepting on a socket
-//    ├─ Acceptor worker 2 │ on accept, hand the connection to the connection
-//    │                    │ supervisor then loop back to accept again
-//    ┆                    │
-//    ├─ Acceptor worker N ┘
+// ├─ Acceptor Pool, OneForOne static_supervisor
+// │  │
+// │  ├─ Acceptor worker 1 ┐
+// │  │                    │ N independent siblings, accepting on a socket
+// │  ├─ Acceptor worker 2 │ on accept, hand the connection to the connection
+// │  │                    │ supervisor then loop back to accept again
+// │  ┆                    │
+// │  └─ Acceptor worker N ┘
+// │  holds the socket and a reference to connection supervisor
+// │  passses listen socket
+// └─ Shutdown worker
+//    accepts listen socket
+//    handles properly shutting down the acceptor
 
 import gleam/bit_array
+import gleam/bytes_tree
 import gleam/erlang/process
 import gleam/list
 import gleam/option
@@ -23,15 +29,15 @@ import gleam/otp/actor
 import gleam/otp/supervision
 import gleam/result
 import gleam/string
-import logging
-import pooler/internals/connection
-import pooler/internals/file
-import pooler/internals/listener
-import pooler/internals/pool
-import pooler/socket
 import relay_supervisor as relay
+import tup/internals/connection
+import tup/internals/file
+import tup/internals/listener
+import tup/internals/pool
+import tup/internals/shutdown
+import tup/socket
 
-pub type Connection(user_message) {
+pub opaque type Connection(user_message) {
   Connection(
     transport: socket.Transport,
     socket: socket.Socket,
@@ -46,6 +52,18 @@ fn from_internal_connection(
     connection.Connection(transport:, socket:, self:) ->
       Connection(transport:, socket:, self:)
   }
+}
+
+pub fn socket(connection: Connection(user_message)) {
+  #(connection.transport, connection.socket)
+}
+
+pub fn send(connection: Connection(user_message), data: bytes_tree.BytesTree) {
+  socket.send(connection.transport, connection.socket, data)
+}
+
+pub fn socket_error_to_string(error: socket.SocketError) {
+  socket.error_to_string(error)
 }
 
 pub opaque type Next(user_state, user_message) {
@@ -72,16 +90,26 @@ pub fn with_selector(
   }
 }
 
-// TODO: custom active state type.
 pub fn with_active_state(
   next: Next(user_state, user_message),
-  active_state: socket.ActiveState,
+  active_state: ActiveState,
 ) {
   case next {
     Continue(..) as next ->
-      Continue(..next, active_state: option.Some(active_state))
+      Continue(
+        ..next,
+        active_state: option.Some(to_socket_active_state(active_state)),
+      )
     remaining -> remaining
   }
+}
+
+pub fn stop() {
+  NormalStop
+}
+
+pub fn stop_abnormal(reason: String) {
+  AbnormalStop(reason:)
 }
 
 fn to_internal_next(
@@ -150,6 +178,10 @@ pub fn new(
   )
 }
 
+pub fn pool_size(builder: Builder(user_state, user_message), pool_size: Int) {
+  Builder(..builder, pool_size:)
+}
+
 pub type Address {
   Tcp(interface: String, port: Int)
   Unix(path: String)
@@ -160,6 +192,27 @@ pub fn listening(
   on address: Address,
 ) {
   Builder(..builder, address:)
+}
+
+pub type ActiveState {
+  Once
+  Count(n: Int)
+  Active
+}
+
+fn to_socket_active_state(active_state: ActiveState) -> socket.ActiveState {
+  case active_state {
+    Once -> socket.Once
+    Count(n:) -> socket.Packets(count: n)
+    Active -> socket.Always
+  }
+}
+
+pub fn active_state(
+  builder: Builder(user_state, user_message),
+  active_state: ActiveState,
+) {
+  Builder(..builder, active_state: to_socket_active_state(active_state))
 }
 
 pub opaque type Tls {
@@ -256,7 +309,11 @@ pub fn supervised(builder: Builder(user_state, user_message)) {
 }
 
 pub fn start(builder: Builder(user_state, user_message)) {
-  use address <- result.try(case builder.address {
+  let Builder(address:, tls:, active_state:, pool_size:, handlers:) = builder
+
+  use pool_size <- try_pool_size(pool_size)
+
+  use address <- result.try(case address {
     Tcp(interface:, port:) -> {
       use <- try_port(port)
       use interface <- try_interface(interface)
@@ -267,17 +324,29 @@ pub fn start(builder: Builder(user_state, user_message)) {
       Ok(listener.Unix(path:))
     }
   })
-  use tls <- try_tls(builder.tls)
+  use tls <- try_tls(tls)
 
-  let listener_argument =
-    listener.Argument(address:, tls:, active_state: builder.active_state)
+  let listener_argument = listener.Argument(address:, tls:)
+  let pool_argument = pool.Argument(pool_size:, active_state:, handlers:)
 
   relay.new(fn(children) {
     listener.add_child(children, listener_argument)
     |> connection.add_child
-    |> pool.add_child(pool_size: builder.pool_size, handlers: builder.handlers)
+    |> pool.add_child(pool_argument)
+    |> shutdown.add_child
   })
   |> relay.start
+}
+
+fn try_pool_size(
+  pool_size: Int,
+  callback: fn(Int) -> Result(a, actor.StartError),
+) -> Result(a, actor.StartError) {
+  case pool_size {
+    pool_size if pool_size <= 0 ->
+      Error(actor.InitFailed("Provided pool size is negative or equals to 0."))
+    pool_size -> callback(pool_size)
+  }
 }
 
 fn try_port(
@@ -285,10 +354,8 @@ fn try_port(
   callback: fn() -> Result(a, actor.StartError),
 ) -> Result(a, actor.StartError) {
   case port {
-    port if port < 0 || port > 65_535 -> {
-      logging.log(logging.Warning, "Invalid port provided!")
+    port if port < 0 || port > 65_535 ->
       Error(actor.InitFailed("Port provided outside of a 0..65535 window."))
-    }
     _port -> callback()
   }
 }
@@ -308,7 +375,7 @@ fn try_interface(
   }
 }
 
-@external(erlang, "pooler_ffi", "parse_address")
+@external(erlang, "tup_ffi", "parse_address")
 fn parse_address(interface: String) -> Result(socket.IpAddress, Nil)
 
 fn try_unix_path(

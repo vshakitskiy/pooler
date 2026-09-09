@@ -1,4 +1,4 @@
--module(pooler_ffi).
+-module(tup_ffi).
 
 -include_lib("kernel/include/file.hrl").
 

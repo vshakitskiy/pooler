@@ -1,4 +1,4 @@
-@external(erlang, "pooler_ffi", "read_file")
+@external(erlang, "tup_ffi", "read_file")
 pub fn read(path: String) -> Result(BitArray, String)
 
 pub fn reason_to_string(reason: String) -> String {

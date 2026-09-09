@@ -879,13 +879,13 @@ pub fn peer_certificate(
 /// not certificates are skipped.
 ///
 /// [`public_key:pem_decode/1`](https://www.erlang.org/doc/apps/public_key/public_key.html#pem_decode/1)
-@external(erlang, "pooler_socket_ffi", "certificates_from_pem")
+@external(erlang, "tup_socket_ffi", "certificates_from_pem")
 pub fn certificates_from_pem(pem: BitArray) -> List(BitArray)
 
 /// The first private key a PEM file holds as the DER `CertificateChain` takes.
 ///
 /// [`public_key:pem_decode/1`](https://www.erlang.org/doc/apps/public_key/public_key.html#pem_decode/1)
-@external(erlang, "pooler_socket_ffi", "private_key_from_pem")
+@external(erlang, "tup_socket_ffi", "private_key_from_pem")
 pub fn private_key_from_pem(
   pem: BitArray,
   password: option.Option(String),
@@ -896,131 +896,131 @@ pub fn private_key_from_pem(
 /// store to read.
 ///
 /// [`public_key:cacerts_get/0`](https://www.erlang.org/doc/apps/public_key/public_key.html#cacerts_get/0)
-@external(erlang, "pooler_socket_ffi", "system_certificate_authorities")
+@external(erlang, "tup_socket_ffi", "system_certificate_authorities")
 pub fn system_certificate_authorities() -> List(BitArray)
 
-@external(erlang, "pooler_socket_ffi", "tcp_listen")
+@external(erlang, "tup_socket_ffi", "tcp_listen")
 fn tcp_listen(
   port: Int,
   options: List(TcpOption),
 ) -> Result(ListenSocket, SocketError)
 
-@external(erlang, "pooler_socket_ffi", "tcp_accept")
+@external(erlang, "tup_socket_ffi", "tcp_accept")
 fn tcp_accept(
   socket: ListenSocket,
   timeout: Timeout,
 ) -> Result(Socket, SocketError)
 
-@external(erlang, "pooler_socket_ffi", "tcp_controlling_process")
+@external(erlang, "tup_socket_ffi", "tcp_controlling_process")
 fn tcp_controlling_process(
   socket: Socket,
   pid: process.Pid,
 ) -> Result(Nil, SocketError)
 
-@external(erlang, "pooler_socket_ffi", "tcp_close")
+@external(erlang, "tup_socket_ffi", "tcp_close")
 fn tcp_close(socket: Socket) -> Result(Nil, SocketError)
 
-@external(erlang, "pooler_socket_ffi", "tcp_close")
+@external(erlang, "tup_socket_ffi", "tcp_close")
 fn tcp_close_listener(socket: ListenSocket) -> Result(Nil, SocketError)
 
-@external(erlang, "pooler_socket_ffi", "tcp_shutdown")
+@external(erlang, "tup_socket_ffi", "tcp_shutdown")
 fn tcp_shutdown(socket: Socket, mode: ShutdownMode) -> Result(Nil, SocketError)
 
-@external(erlang, "pooler_socket_ffi", "tcp_send")
+@external(erlang, "tup_socket_ffi", "tcp_send")
 fn tcp_send(
   socket: Socket,
   data: bytes_tree.BytesTree,
 ) -> Result(Nil, SocketError)
 
-@external(erlang, "pooler_socket_ffi", "tcp_receive")
+@external(erlang, "tup_socket_ffi", "tcp_receive")
 fn tcp_receive(
   socket: Socket,
   bytes: Int,
   timeout: Timeout,
 ) -> Result(BitArray, SocketError)
 
-@external(erlang, "pooler_socket_ffi", "tcp_set_options")
+@external(erlang, "tup_socket_ffi", "tcp_set_options")
 fn tcp_set_options(
   socket: Socket,
   options: List(TcpOption),
 ) -> Result(Nil, SocketError)
 
-@external(erlang, "pooler_socket_ffi", "tcp_sockname")
+@external(erlang, "tup_socket_ffi", "tcp_sockname")
 fn tcp_sockname(socket: Socket) -> Result(Endpoint, SocketError)
 
-@external(erlang, "pooler_socket_ffi", "tcp_sockname")
+@external(erlang, "tup_socket_ffi", "tcp_sockname")
 fn tcp_sockname_listener(socket: ListenSocket) -> Result(Endpoint, SocketError)
 
-@external(erlang, "pooler_socket_ffi", "tcp_peername")
+@external(erlang, "tup_socket_ffi", "tcp_peername")
 fn tcp_peername(socket: Socket) -> Result(Endpoint, SocketError)
 
-@external(erlang, "pooler_socket_ffi", "ssl_listen")
+@external(erlang, "tup_socket_ffi", "ssl_listen")
 fn ssl_listen(
   port: Int,
   options: List(TcpOption),
   tls_options: List(TlsOption),
 ) -> Result(ListenSocket, SocketError)
 
-@external(erlang, "pooler_socket_ffi", "ssl_accept")
+@external(erlang, "tup_socket_ffi", "ssl_accept")
 fn ssl_accept(
   socket: ListenSocket,
   timeout: Timeout,
 ) -> Result(Socket, SocketError)
 
-@external(erlang, "pooler_socket_ffi", "ssl_handshake")
+@external(erlang, "tup_socket_ffi", "ssl_handshake")
 fn ssl_handshake(
   socket: Socket,
   timeout: Timeout,
 ) -> Result(Socket, SocketError)
 
-@external(erlang, "pooler_socket_ffi", "ssl_controlling_process")
+@external(erlang, "tup_socket_ffi", "ssl_controlling_process")
 fn ssl_controlling_process(
   socket: Socket,
   pid: process.Pid,
 ) -> Result(Nil, SocketError)
 
-@external(erlang, "pooler_socket_ffi", "ssl_close")
+@external(erlang, "tup_socket_ffi", "ssl_close")
 fn ssl_close(socket: Socket) -> Result(Nil, SocketError)
 
-@external(erlang, "pooler_socket_ffi", "ssl_close")
+@external(erlang, "tup_socket_ffi", "ssl_close")
 fn ssl_close_listener(socket: ListenSocket) -> Result(Nil, SocketError)
 
-@external(erlang, "pooler_socket_ffi", "ssl_shutdown")
+@external(erlang, "tup_socket_ffi", "ssl_shutdown")
 fn ssl_shutdown(socket: Socket, mode: ShutdownMode) -> Result(Nil, SocketError)
 
-@external(erlang, "pooler_socket_ffi", "ssl_send")
+@external(erlang, "tup_socket_ffi", "ssl_send")
 fn ssl_send(
   socket: Socket,
   data: bytes_tree.BytesTree,
 ) -> Result(Nil, SocketError)
 
-@external(erlang, "pooler_socket_ffi", "ssl_receive")
+@external(erlang, "tup_socket_ffi", "ssl_receive")
 fn ssl_receive(
   socket: Socket,
   bytes: Int,
   timeout: Timeout,
 ) -> Result(BitArray, SocketError)
 
-@external(erlang, "pooler_socket_ffi", "ssl_set_options")
+@external(erlang, "tup_socket_ffi", "ssl_set_options")
 fn ssl_set_options(
   socket: Socket,
   options: List(TcpOption),
 ) -> Result(Nil, SocketError)
 
-@external(erlang, "pooler_socket_ffi", "ssl_sockname")
+@external(erlang, "tup_socket_ffi", "ssl_sockname")
 fn ssl_sockname(socket: Socket) -> Result(Endpoint, SocketError)
 
-@external(erlang, "pooler_socket_ffi", "ssl_sockname")
+@external(erlang, "tup_socket_ffi", "ssl_sockname")
 fn ssl_sockname_listener(socket: ListenSocket) -> Result(Endpoint, SocketError)
 
-@external(erlang, "pooler_socket_ffi", "ssl_peername")
+@external(erlang, "tup_socket_ffi", "ssl_peername")
 fn ssl_peername(socket: Socket) -> Result(Endpoint, SocketError)
 
-@external(erlang, "pooler_socket_ffi", "ssl_negotiated_protocol")
+@external(erlang, "tup_socket_ffi", "ssl_negotiated_protocol")
 fn ssl_negotiated_protocol(socket: Socket) -> Result(BitArray, SocketError)
 
-@external(erlang, "pooler_socket_ffi", "ssl_peer_certificate")
+@external(erlang, "tup_socket_ffi", "ssl_peer_certificate")
 fn ssl_peer_certificate(socket: Socket) -> Result(BitArray, SocketError)
 
-@external(erlang, "pooler_socket_ffi", "message")
+@external(erlang, "tup_socket_ffi", "message")
 fn to_message(message: dynamic.Dynamic) -> Message

@@ -1,16 +1,12 @@
 import gleam/option
 import gleam/otp/actor
 import gleam/otp/supervision
-import pooler/internals/file
-import pooler/socket
 import relay_supervisor as relay
+import tup/internals/file
+import tup/socket
 
 pub type Argument {
-  Argument(
-    address: Address,
-    tls: option.Option(List(socket.TlsOption)),
-    active_state: socket.ActiveState,
-  )
+  Argument(address: Address, tls: option.Option(List(socket.TlsOption)))
 }
 
 pub type Relayed {
@@ -45,6 +41,9 @@ fn start(argument: Argument) {
     let tcp_options = [
       socket.BindAddress(interface),
       socket.Active(socket.Passive),
+      socket.SendTimeout(socket.Milliseconds(30_000)),
+      socket.ReuseAddress(True),
+      socket.SendTimeoutClose(True),
     ]
 
     let listen = case argument.tls {
@@ -135,5 +134,5 @@ fn try_unlink_stale_socket(
   }
 }
 
-@external(erlang, "pooler_ffi", "unlink_stale_socket")
+@external(erlang, "tup_ffi", "unlink_stale_socket")
 fn unlink_stale_socket(path: String) -> Result(Nil, SocketPathError)

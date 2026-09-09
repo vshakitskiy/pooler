@@ -5,36 +5,55 @@ import gleam/otp/factory_supervisor as factory
 import gleam/otp/static_supervisor as supervisor
 import gleam/otp/supervision
 import logging
-import pooler/internals/connection
-import pooler/socket
 import relay_supervisor as relay
+import tup/internals/connection
+import tup/socket
+
+pub type Argument(user_state, user_message) {
+  Argument(
+    pool_size: Int,
+    active_state: socket.ActiveState,
+    handlers: connection.Handlers(user_state, user_message),
+  )
+}
+
+pub type Relayed {
+  Relayed(transport: socket.Transport, socket: socket.ListenSocket)
+}
 
 pub fn add_child(
   children: relay.Children(connection.Relayed(user_state, user_message)),
-  pool_size pool_size: Int,
-  handlers handlers: connection.Handlers(user_state, user_message),
+  argument: Argument(user_state, user_message),
 ) {
   relay.Template(start:, child_type: supervision.Supervisor)
   |> relay.child
-  |> relay.providing(fn(relayed) { #(relayed, pool_size, handlers) })
-  |> relay.returning(fn(_argument, _supervisor) { Nil })
+  |> relay.providing(fn(relayed) { #(relayed, argument) })
+  |> relay.returning(fn(argument, _supervisor) {
+    let connection.Relayed(transport:, socket:, ..) = argument
+    Relayed(transport:, socket:)
+  })
   |> relay.add(children, _)
 }
 
 fn start(
   argument: #(
     connection.Relayed(user_state, user_message),
-    Int,
-    connection.Handlers(user_state, user_message),
+    Argument(user_state, user_message),
   ),
 ) -> Result(actor.Started(supervisor.Supervisor), actor.StartError) {
-  let #(relayed, pool_size, handlers) = argument
+  let #(relayed, argument) = argument
 
   supervisor.new(supervisor.OneForOne)
-  |> int.range(from: 0, to: pool_size, with: _, run: fn(supervisor, _index) {
-    supervision.worker(fn() { start_worker(relayed, handlers) })
-    |> supervisor.add(supervisor, _)
-  })
+  |> int.range(
+    from: 0,
+    to: argument.pool_size,
+    with: _,
+    run: fn(supervisor, _index) {
+      supervision.worker(fn() { start_worker(relayed, argument) })
+      |> supervision.restart(supervision.Transient)
+      |> supervisor.add(supervisor, _)
+    },
+  )
   |> supervisor.start
 }
 
@@ -51,6 +70,7 @@ type State(user_state, user_message) {
       connection.Argument(user_state, user_message),
       process.Subject(connection.Message(user_message)),
     ),
+    active_state: socket.ActiveState,
     pid: process.Pid,
     self: process.Subject(Message),
     handlers: connection.Handlers(user_state, user_message),
@@ -59,17 +79,20 @@ type State(user_state, user_message) {
 
 fn start_worker(
   relayed: connection.Relayed(user_state, user_message),
-  handlers: connection.Handlers(user_state, user_message),
+  argument: Argument(user_state, user_message),
 ) {
   actor.new_with_initialiser(1000, fn(self) {
     process.send(self, Accept)
 
     let connection.Relayed(transport:, socket:, endpoint:, factory:) = relayed
+    let Argument(active_state:, handlers:, ..) = argument
+
     State(
       transport:,
       socket:,
       endpoint:,
       factory:,
+      active_state:,
       pid: process.self(),
       self:,
       handlers:,
@@ -79,7 +102,16 @@ fn start_worker(
     |> Ok
   })
   |> actor.on_message(fn(state, _message) {
-    let State(transport:, socket:, endpoint:, factory:, pid:, ..) = state
+    let State(
+      transport:,
+      socket:,
+      endpoint:,
+      factory:,
+      active_state:,
+      pid:,
+      handlers:,
+      ..,
+    ) = state
 
     case socket.accept(transport, socket, socket.Milliseconds(30_000)) {
       Ok(socket) -> {
@@ -89,6 +121,7 @@ fn start_worker(
             socket:,
             server: endpoint,
             acceptor: pid,
+            active_state:,
             handlers:,
           )
         case factory.start_child(factory, argument) {
