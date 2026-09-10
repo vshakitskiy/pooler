@@ -1,25 +1,3 @@
-// Root Supervisor, RestForOne relay_supervisor
-// │
-// ├─ Listener worker
-// │  opens the TCP listen socket
-// │  passes socket
-// ├─ Connection Supervisor, OneForOne Transient factory_supervisor
-// │  holds the template for handling one accepted connection
-// │  passes socket and a reference to itself
-// ├─ Acceptor Pool, OneForOne static_supervisor
-// │  │
-// │  ├─ Acceptor worker 1 ┐
-// │  │                    │ N independent siblings, accepting on a socket
-// │  ├─ Acceptor worker 2 │ on accept, hand the connection to the connection
-// │  │                    │ supervisor then loop back to accept again
-// │  ┆                    │
-// │  └─ Acceptor worker N ┘
-// │  holds the socket and a reference to connection supervisor
-// │  passses listen socket
-// └─ Shutdown worker
-//    accepts listen socket
-//    handles properly shutting down the acceptor
-
 import gleam/bit_array
 import gleam/bytes_tree
 import gleam/erlang/process
@@ -34,7 +12,6 @@ import tup/internals/connection
 import tup/internals/file
 import tup/internals/listener
 import tup/internals/pool
-import tup/internals/shutdown
 import tup/socket
 
 pub opaque type Connection(user_message) {
@@ -329,11 +306,65 @@ pub fn start(builder: Builder(user_state, user_message)) {
   let listener_argument = listener.Argument(address:, tls:)
   let pool_argument = pool.Argument(pool_size:, active_state:, handlers:)
 
+  // The current supervision tree design is:
+  //
+  // ┆
+  // ┆
+  // └─ Root Supervisor, RestForOne outer relay_supervisor
+  //    ├─ Connection Supervisor, OneForOne Transient factory_supervisor
+  //    │  └─ Spawned Connection, worker N
+  //    └─ Inner relay, RestForOne inner relay_supervisor
+  //       ├─ Listener, worker
+  //       └─ Acceptor Pool, OneForOne static_supervisor
+  //         ├─ Acceptor, worker 1
+  //         ├─ Acceptor, worker 2
+  //         ┆
+  //         ┆
+  //         └─ Acceptor, worker N
+  //
+  // At the time of writing the documentation lines, current implementation 
+  // provides these solutions over Glisten:
+  //
+  // - There is no enforced process naming in Tup. Relay supervisors allows the 
+  //   children to accept and return arguments to the next children in the order.
+  //   *However*! This comes with a small tradeoff. Relay supervisors are using 
+  //   RestForOne strategies. On a connection supervisor restart the restart 
+  //   cascased through the inner relay and the listen socket is reopened. 
+  //   Glisten's acceptor uses a name for referencing its connection supervisor 
+  //   and allows each child survive the restarts without touching the port. 
+  //
+  // - Accept errors are handled properly. Glisten kills the acceptor on any 
+  //   accept error. In Tup I decided that on Closed or Einval we can stop 
+  //   normally, on Emfile or Enfile it's better to wait some time, around 100ms.
+  //   On Timeout or Econnaborted there is no reason to abnormally crash, just
+  //   continue looping over the acceptor.
+  //   
+  //   This matters most under descriptor exhaustion. Glisten treats Emfile as
+  //   abnormal and its acceptors are Permanent so every acceptor crashes and
+  //   is restarted straight back into the same error until the pool supervisor
+  //   reaches its restart intensity and dies.
+  //
+  // - Any handoff race is pretty much resolved. Glisten's connection waits for
+  //   Ready with no monitor or timeout, so an acceptor dying mid handoff leaks
+  //   a connection process or, in the worst timing when acceptor died after 
+  //   transfering socket controls, a fd. Tup monitors the acceptor and 
+  //   demonitors on Ready.
+  //
+  // - The shutdown order is changed. Glisten kills the connections first while
+  //   acceptors still accept and the port is still open. This can create a 
+  //   scenario during the shutdown phase when the connections are accepted, 
+  //   leading them to fail. Tup kills acceptor and socket first and only after 
+  //   that deals with connections.
+  //
+  // - Glisten has no timeout on accepting the connection. It may seem okay at
+  //   first but there is no way to use the tracing and debugging features in
+  //   OTP that actor abstraction provides while the accept is infinitely 
+  //   waiting for the new connection. Tup has 30 seconds accept timeout that 
+  //   can at least provide some interval for reading incomming OTP messages.
+  //
   relay.new(fn(children) {
-    listener.add_child(children, listener_argument)
-    |> connection.add_child
-    |> pool.add_child(pool_argument)
-    |> shutdown.add_child
+    connection.add_child(children)
+    |> pool.add_child(listener_argument, pool_argument)
   })
   |> relay.start
 }

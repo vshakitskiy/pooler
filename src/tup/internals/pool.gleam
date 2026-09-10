@@ -7,7 +7,46 @@ import gleam/otp/supervision
 import logging
 import relay_supervisor as relay
 import tup/internals/connection
+import tup/internals/listener
 import tup/socket
+
+pub fn add_child(
+  children: relay.Children(
+    factory.Supervisor(
+      connection.Argument(user_state, user_message),
+      process.Subject(connection.Message(user_message)),
+    ),
+  ),
+  listener_argument: listener.Argument,
+  pool_argument: Argument(user_state, user_message),
+) {
+  relay.Template(start: start_relay, child_type: supervision.Supervisor)
+  |> relay.child
+  |> relay.providing(fn(factory) {
+    #(factory, listener_argument, pool_argument)
+  })
+  |> relay.returning(fn(_factory, _relay) { Nil })
+  |> relay.add(children, _)
+}
+
+fn start_relay(
+  argument: #(
+    factory.Supervisor(
+      connection.Argument(user_state, user_message),
+      process.Subject(connection.Message(user_message)),
+    ),
+    listener.Argument,
+    Argument(user_state, user_message),
+  ),
+) -> Result(actor.Started(relay.Supervisor), actor.StartError) {
+  let #(factory, listener_argument, pool_argument) = argument
+
+  relay.new(fn(children) {
+    listener.add_child(children, listener_argument)
+    |> add_pool(pool_argument, factory)
+  })
+  |> relay.start
+}
 
 pub type Argument(user_state, user_message) {
   Argument(
@@ -17,31 +56,32 @@ pub type Argument(user_state, user_message) {
   )
 }
 
-pub type Relayed {
-  Relayed(transport: socket.Transport, socket: socket.ListenSocket)
-}
-
-pub fn add_child(
-  children: relay.Children(connection.Relayed(user_state, user_message)),
+fn add_pool(
+  children: relay.Children(listener.Relayed),
   argument: Argument(user_state, user_message),
-) {
-  relay.Template(start:, child_type: supervision.Supervisor)
+  factory: factory.Supervisor(
+    connection.Argument(user_state, user_message),
+    process.Subject(connection.Message(user_message)),
+  ),
+) -> relay.Children(Nil) {
+  relay.Template(start: start_pool, child_type: supervision.Supervisor)
   |> relay.child
-  |> relay.providing(fn(relayed) { #(relayed, argument) })
-  |> relay.returning(fn(argument, _supervisor) {
-    let connection.Relayed(transport:, socket:, ..) = argument
-    Relayed(transport:, socket:)
-  })
+  |> relay.providing(fn(relayed) { #(relayed, argument, factory) })
+  |> relay.returning(fn(_relayed, _supervisor) { Nil })
   |> relay.add(children, _)
 }
 
-fn start(
+fn start_pool(
   argument: #(
-    connection.Relayed(user_state, user_message),
+    listener.Relayed,
     Argument(user_state, user_message),
+    factory.Supervisor(
+      connection.Argument(user_state, user_message),
+      process.Subject(connection.Message(user_message)),
+    ),
   ),
 ) -> Result(actor.Started(supervisor.Supervisor), actor.StartError) {
-  let #(relayed, argument) = argument
+  let #(relayed, argument, factory) = argument
 
   supervisor.new(supervisor.OneForOne)
   |> int.range(
@@ -49,7 +89,7 @@ fn start(
     to: argument.pool_size,
     with: _,
     run: fn(supervisor, _index) {
-      supervision.worker(fn() { start_worker(relayed, argument) })
+      supervision.worker(fn() { start_acceptor(relayed, argument, factory) })
       |> supervision.restart(supervision.Transient)
       |> supervisor.add(supervisor, _)
     },
@@ -77,14 +117,18 @@ type State(user_state, user_message) {
   )
 }
 
-fn start_worker(
-  relayed: connection.Relayed(user_state, user_message),
+fn start_acceptor(
+  relayed: listener.Relayed,
   argument: Argument(user_state, user_message),
+  factory: factory.Supervisor(
+    connection.Argument(user_state, user_message),
+    process.Subject(connection.Message(user_message)),
+  ),
 ) {
   actor.new_with_initialiser(1000, fn(self) {
     process.send(self, Accept)
 
-    let connection.Relayed(transport:, socket:, endpoint:, factory:) = relayed
+    let listener.Relayed(transport:, socket:, endpoint:) = relayed
     let Argument(active_state:, handlers:, ..) = argument
 
     State(

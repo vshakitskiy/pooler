@@ -6,7 +6,6 @@ import gleam/otp/factory_supervisor as factory
 import gleam/otp/supervision
 import logging
 import relay_supervisor as relay
-import tup/internals/listener
 import tup/socket
 
 pub type Relayed(user_state, user_message) {
@@ -14,23 +13,21 @@ pub type Relayed(user_state, user_message) {
     transport: socket.Transport,
     socket: socket.ListenSocket,
     endpoint: socket.Endpoint,
-    factory: factory.Supervisor(
-      Argument(user_state, user_message),
-      process.Subject(Message(user_message)),
-    ),
   )
 }
 
 pub fn add_child(
-  children: relay.Children(listener.Relayed),
-) -> relay.Children(Relayed(user_state, user_message)) {
+  children: relay.Children(Nil),
+) -> relay.Children(
+  factory.Supervisor(
+    Argument(user_state, user_message),
+    process.Subject(Message(user_message)),
+  ),
+) {
   relay.Template(start:, child_type: supervision.Supervisor)
   |> relay.child
   |> relay.providing(fn(_relayed) { Nil })
-  |> relay.returning(fn(relayed, factory) {
-    let listener.Relayed(transport:, socket:, endpoint:) = relayed
-    Relayed(transport:, socket:, endpoint:, factory:)
-  })
+  |> relay.returning(fn(_relayed, factory) { factory })
   |> relay.add(children, _)
 }
 

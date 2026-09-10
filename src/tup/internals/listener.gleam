@@ -44,6 +44,7 @@ fn start(argument: Argument) {
       socket.SendTimeout(socket.Milliseconds(30_000)),
       socket.ReuseAddress(True),
       socket.SendTimeoutClose(True),
+      socket.Backlog(1024),
     ]
 
     let listen = case argument.tls {
