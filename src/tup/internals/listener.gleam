@@ -10,11 +10,7 @@ pub type Argument {
 }
 
 pub type Relayed {
-  Relayed(
-    transport: socket.Transport,
-    socket: socket.ListenSocket,
-    endpoint: socket.Endpoint,
-  )
+  Relayed(transport: socket.Transport, socket: socket.ListenSocket)
 }
 
 pub type Address {
@@ -56,9 +52,9 @@ fn start(argument: Argument) {
     case listen {
       Ok(#(transport, socket)) -> {
         case socket.sockname_listener(transport, socket) {
-          Ok(endpoint) -> {
-            actor.initialised(Nil)
-            |> actor.returning(Relayed(transport:, socket:, endpoint:))
+          Ok(local) -> {
+            actor.initialised(local)
+            |> actor.returning(Relayed(transport:, socket:))
             |> Ok
           }
           Error(error) ->

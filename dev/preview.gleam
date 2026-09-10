@@ -8,6 +8,11 @@ pub fn main() -> Nil {
   logging.set_level(logging.Debug)
   logging.configure()
 
+  // TODO:
+  // server endpoint outside the acceptor?
+  // draining mechanism?
+  // clean docs?
+
   let subject = process.new_subject()
 
   let assert Ok(_started) =

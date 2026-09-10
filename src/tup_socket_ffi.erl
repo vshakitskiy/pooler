@@ -9,7 +9,7 @@
          ssl_controlling_process/2, ssl_close/1, ssl_shutdown/2, ssl_send/2,
          ssl_receive/3, ssl_set_options/2, ssl_sockname/1, ssl_peername/1,
          ssl_negotiated_protocol/1, ssl_peer_certificate/1,
-         certificates_from_pem/1, private_key_from_pem/2,
+         certificates_from_pem/1, private_key_from_pem/2, ip_address_to_string/1,
          system_certificate_authorities/0,
          message/1, reason/1]).
 
@@ -263,6 +263,21 @@ from_ip_address({ipv4, A, B, C, D}) ->
     {A, B, C, D};
 from_ip_address({ipv6, A, B, C, D, E, F, G, H}) ->
     {A, B, C, D, E, F, G, H}.
+
+ip_address_to_string(Address) ->
+    case inet:ntoa(from_ip_address(Address)) of
+        {error, einval} -> unchecked_ip_address(Address);
+        Text -> list_to_binary(Text)
+    end.
+
+unchecked_ip_address({ipv4, A, B, C, D}) ->
+    iolist_to_binary(lists:join(<<".">>,
+                                [integer_to_binary(Part)
+                                 || Part <- [A, B, C, D]]));
+unchecked_ip_address({ipv6, A, B, C, D, E, F, G, H}) ->
+    iolist_to_binary(lists:join(<<":">>,
+                                [string:lowercase(integer_to_binary(Part, 16))
+                                 || Part <- [A, B, C, D, E, F, G, H]])).
 
 timeout({milliseconds, Milliseconds}) -> Milliseconds;
 timeout(never) -> infinity.

@@ -105,7 +105,6 @@ type State(user_state, user_message) {
   State(
     transport: socket.Transport,
     socket: socket.ListenSocket,
-    endpoint: socket.Endpoint,
     factory: factory.Supervisor(
       connection.Argument(user_state, user_message),
       process.Subject(connection.Message(user_message)),
@@ -128,13 +127,12 @@ fn start_acceptor(
   actor.new_with_initialiser(1000, fn(self) {
     process.send(self, Accept)
 
-    let listener.Relayed(transport:, socket:, endpoint:) = relayed
+    let listener.Relayed(transport:, socket:) = relayed
     let Argument(active_state:, handlers:, ..) = argument
 
     State(
       transport:,
       socket:,
-      endpoint:,
       factory:,
       active_state:,
       pid: process.self(),
@@ -146,16 +144,8 @@ fn start_acceptor(
     |> Ok
   })
   |> actor.on_message(fn(state, _message) {
-    let State(
-      transport:,
-      socket:,
-      endpoint:,
-      factory:,
-      active_state:,
-      pid:,
-      handlers:,
-      ..,
-    ) = state
+    let State(transport:, socket:, factory:, active_state:, pid:, handlers:, ..) =
+      state
 
     case socket.accept(transport, socket, socket.Milliseconds(30_000)) {
       Ok(socket) -> {
@@ -163,7 +153,6 @@ fn start_acceptor(
           connection.Argument(
             transport:,
             socket:,
-            server: endpoint,
             acceptor: pid,
             active_state:,
             handlers:,
@@ -224,7 +213,7 @@ fn actor_start_error_to_string(error: actor.StartError) -> String {
       "initialisation process failed with reason \"" <> reason <> "\""
     actor.InitExited(process.Normal) -> "initialisation process exited normally"
     actor.InitExited(process.Killed) -> "initialisation process was killed"
-    actor.InitExited(process.Abnormal(reason: _)) ->
+    actor.InitExited(process.Abnormal(reason: _reason)) ->
       "initialisation process was killed abnormally!"
   }
 }

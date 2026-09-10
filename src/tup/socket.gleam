@@ -9,6 +9,7 @@ import gleam/bytes_tree
 import gleam/dynamic
 import gleam/erlang/atom
 import gleam/erlang/process
+import gleam/int
 import gleam/option
 import gleam/result
 import gleam/string
@@ -624,6 +625,28 @@ pub fn pem_error_to_string(error: PemError) -> String {
     EncryptedPrivateKey -> "the key is encrypted and no password was given"
     WrongPassword ->
       "the key is encrypted and the password given does not decrypt it"
+  }
+}
+
+/// An address as text. Follows [RFC 5952](https://www.rfc-editor.org/rfc/rfc5952): 
+/// lower case hex with the longest run of zero groups compressed, an IPv4 
+/// mapped address in its mixed form such as `::ffff:192.0.2.1`.
+///
+/// [`inet:ntoa/1`](https://www.erlang.org/doc/apps/kernel/inet.html#ntoa/1)
+@external(erlang, "tup_socket_ffi", "ip_address_to_string")
+pub fn ip_address_to_string(address: IpAddress) -> String
+
+/// An endpoint as text. An abstract Unix address whose path starts with a NUL 
+/// byte is written with a leading `@` the way. An unnamed Unix endpoint is an 
+/// empty string.
+pub fn endpoint_to_string(endpoint: Endpoint) -> String {
+  case endpoint {
+    TcpEndpoint(ip_address: Ipv4(..) as address, port:) ->
+      ip_address_to_string(address) <> ":" <> int.to_string(port)
+    TcpEndpoint(ip_address: Ipv6(..) as address, port:) ->
+      "[" <> ip_address_to_string(address) <> "]:" <> int.to_string(port)
+    UnixEndpoint(path: "\u{0}" <> name) -> "@" <> name
+    UnixEndpoint(path:) -> path
   }
 }
 

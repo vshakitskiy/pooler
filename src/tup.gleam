@@ -1,6 +1,7 @@
 import gleam/bit_array
 import gleam/bytes_tree
 import gleam/erlang/process
+import gleam/int
 import gleam/list
 import gleam/option
 import gleam/otp/actor
@@ -14,28 +15,114 @@ import tup/internals/listener
 import tup/internals/pool
 import tup/socket
 
-pub opaque type Connection(user_message) {
-  Connection(
-    transport: socket.Transport,
-    socket: socket.Socket,
-    self: process.Subject(connection.Message(user_message)),
-  )
+/// An IPv4 or IPv6 address.
+pub type IpAddress {
+  /// Four octets.
+  Ipv4(Int, Int, Int, Int)
+  /// Eight 16 bit groups.
+  Ipv6(Int, Int, Int, Int, Int, Int, Int, Int)
 }
 
-fn from_internal_connection(
-  connection: connection.Connection(user_message),
-) -> Connection(user_message) {
-  case connection {
-    connection.Connection(transport:, socket:, self:) ->
-      Connection(transport:, socket:, self:)
+pub fn ip_address_to_string(address: IpAddress) {
+  to_socket_ip_address(address)
+  |> socket.ip_address_to_string
+}
+
+/// Extracts the IPv4 address inside an IPv4 mapped IPv6 address.
+/// 
+/// ```gleam
+/// unmap_ipv4(Ipv6(0, 0, 0, 0, 0, 0xffff, 0x7f00, 0x0001))
+/// // -> Ipv4(127, 0, 0, 1)
+/// ```
+pub fn unmap_ipv4(address: IpAddress) -> IpAddress {
+  case address {
+    Ipv6(0, 0, 0, 0, 0, 0xffff, high, low) ->
+      Ipv4(
+        int.bitwise_shift_right(high, 8),
+        int.bitwise_and(high, 0xff),
+        int.bitwise_shift_right(low, 8),
+        int.bitwise_and(low, 0xff),
+      )
+    Ipv4(..) | Ipv6(..) -> address
   }
 }
 
-pub fn socket(connection: Connection(user_message)) {
+fn from_socket_ip_address(address: socket.IpAddress) {
+  case address {
+    socket.Ipv4(a, b, c, d) -> Ipv4(a, b, c, d)
+    socket.Ipv6(a, b, c, d, e, f, g, h) -> Ipv6(a, b, c, d, e, f, g, h)
+  }
+}
+
+fn to_socket_ip_address(address: IpAddress) {
+  case address {
+    Ipv4(a, b, c, d) -> socket.Ipv4(a, b, c, d)
+    Ipv6(a, b, c, d, e, f, g, h) -> socket.Ipv6(a, b, c, d, e, f, g, h)
+  }
+}
+
+pub opaque type Connection {
+  Connection(
+    transport: socket.Transport,
+    socket: socket.Socket,
+    local: Endpoint,
+    peer: Endpoint,
+  )
+}
+
+fn from_internal_connection(connection: connection.Connection) -> Connection {
+  case connection {
+    connection.Connection(transport:, socket:, local:, peer:) ->
+      Connection(
+        transport:,
+        socket:,
+        local: from_socket_endpoint(local),
+        peer: from_socket_endpoint(peer),
+      )
+  }
+}
+
+pub fn socket(connection: Connection) {
   #(connection.transport, connection.socket)
 }
 
-pub fn send(connection: Connection(user_message), data: bytes_tree.BytesTree) {
+pub type Endpoint {
+  /// An address and a port on a TCP socket.
+  TcpEndpoint(ip_address: IpAddress, port: Int)
+  /// The path of a Unix domain socket.
+  UnixEndpoint(path: String)
+}
+
+pub fn endpoint_to_string(endpoint: Endpoint) {
+  to_socket_endpoint(endpoint)
+  |> socket.endpoint_to_string
+}
+
+fn from_socket_endpoint(endpoint: socket.Endpoint) -> Endpoint {
+  case endpoint {
+    socket.TcpEndpoint(ip_address:, port:) ->
+      TcpEndpoint(ip_address: from_socket_ip_address(ip_address), port:)
+    socket.UnixEndpoint(path:) -> UnixEndpoint(path:)
+  }
+}
+
+fn to_socket_endpoint(endpoint: Endpoint) -> socket.Endpoint {
+  case endpoint {
+    TcpEndpoint(ip_address:, port:) ->
+      socket.TcpEndpoint(ip_address: to_socket_ip_address(ip_address), port:)
+    UnixEndpoint(path:) -> socket.UnixEndpoint(path:)
+  }
+}
+
+pub fn peer(connection: Connection) {
+  connection.peer
+}
+
+pub fn local(connection: Connection) {
+  connection.local
+}
+
+pub fn send(connection: Connection, data: bytes_tree.BytesTree) {
   socket.send(connection.transport, connection.socket, data)
 }
 
@@ -125,13 +212,10 @@ pub opaque type Builder(user_state, user_message) {
 }
 
 pub fn new(
-  on_init on_init: fn(Connection(user_message), process.Selector(user_message)) ->
+  on_init on_init: fn(Connection, process.Selector(user_message)) ->
     #(user_state, process.Selector(user_message)),
-  handler handler: fn(
-    Connection(user_message),
-    user_state,
-    Message(user_message),
-  ) -> Next(user_state, user_message),
+  handler handler: fn(Connection, user_state, Message(user_message)) ->
+    Next(user_state, user_message),
   on_close on_close: fn(user_state) -> Nil,
 ) -> Builder(user_state, user_message) {
   Builder(
@@ -396,10 +480,10 @@ fn try_interface(
   callback: fn(socket.Interface) -> Result(a, actor.StartError),
 ) -> Result(a, actor.StartError) {
   case interface, parse_address(interface) {
-    "0.0.0.0", _ -> callback(socket.Any)
-    "localhost", _ | "127.0.0.1", _ -> callback(socket.Loopback)
-    _, Ok(ip_address) -> callback(socket.Address(ip_address))
-    _, Error(Nil) ->
+    "0.0.0.0", _parsed -> callback(socket.Any)
+    "localhost", _parsed | "127.0.0.1", _parsed -> callback(socket.Loopback)
+    _interface, Ok(ip_address) -> callback(socket.Address(ip_address))
+    _interface, Error(Nil) ->
       "Invalid interface provided. The value must be a valid IPv4/IPv6 address or \"localhost\""
       |> actor.InitFailed
       |> Error
@@ -413,9 +497,11 @@ fn try_unix_path(
   path: String,
   callback: fn() -> Result(a, actor.StartError),
 ) -> Result(a, actor.StartError) {
+  // TODO: a unix path that exists but isn't a socket, for example Unix("/tmp"), 
+  // kills the caller instead of returning an Error.
   case path, string.byte_size(path) {
-    "", _ -> Error(actor.InitFailed("Empty unix path is not allowed."))
-    _, length if length > 107 ->
+    "", _length -> Error(actor.InitFailed("Empty unix path is not allowed."))
+    _path, length if length > 107 ->
       Error(actor.InitFailed("Unix path must not be over 107 bytes limit."))
     path, _length -> {
       case string.contains(does: path, contain: "\u{000000}") {
@@ -467,12 +553,12 @@ fn try_alpn(
   list.unique(alpn)
   |> list.try_map(with: fn(protocol) {
     case protocol, string.byte_size(protocol) {
-      "", _ -> Error(actor.InitFailed("Empty ALPN protocol provided."))
-      _, length if length > 255 ->
+      "", _length -> Error(actor.InitFailed("Empty ALPN protocol provided."))
+      _protocol, length if length > 255 ->
         Error(actor.InitFailed(
           "\"" <> protocol <> "\" ALPN protocol exceeded 255 byte limit.",
         ))
-      _, _ -> Ok(bit_array.from_string(protocol))
+      _protocol, _length -> Ok(bit_array.from_string(protocol))
     }
   })
   |> result.try(callback)

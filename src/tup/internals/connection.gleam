@@ -35,7 +35,6 @@ pub type Argument(user_state, user_message) {
   Argument(
     transport: socket.Transport,
     socket: socket.Socket,
-    server: socket.Endpoint,
     acceptor: process.Pid,
     active_state: socket.ActiveState,
     handlers: Handlers(user_state, user_message),
@@ -44,13 +43,10 @@ pub type Argument(user_state, user_message) {
 
 pub type Handlers(user_state, user_message) {
   Handlers(
-    on_init: fn(Connection(user_message), process.Selector(user_message)) ->
+    on_init: fn(Connection, process.Selector(user_message)) ->
       #(user_state, process.Selector(user_message)),
-    handler: fn(
-      Connection(user_message),
-      user_state,
-      HandlerMessage(user_message),
-    ) -> Next(user_state, user_message),
+    handler: fn(Connection, user_state, HandlerMessage(user_message)) ->
+      Next(user_state, user_message),
     on_close: fn(user_state) -> Nil,
   )
 }
@@ -65,11 +61,12 @@ pub type Next(user_state, user_message) {
   AbnormalStop(reason: String)
 }
 
-pub type Connection(user_message) {
+pub type Connection {
   Connection(
     transport: socket.Transport,
     socket: socket.Socket,
-    self: process.Subject(Message(user_message)),
+    local: socket.Endpoint,
+    peer: socket.Endpoint,
   )
 }
 
@@ -105,36 +102,26 @@ type State(user_state, user_message) {
   Initialised(
     transport: socket.Transport,
     socket: socket.Socket,
-    active_state: socket.ActiveState,
     self: process.Subject(Message(user_message)),
-    selector: process.Selector(Message(user_message)),
+    init_selector: process.Selector(Message(user_message)),
+    active_state: socket.ActiveState,
     handlers: Handlers(user_state, user_message),
-    server: socket.Endpoint,
     monitor: process.Monitor,
   )
   Acknowledged(
-    transport: socket.Transport,
-    socket: socket.Socket,
-    active_state: socket.ActiveState,
+    connection: Connection,
     self: process.Subject(Message(user_message)),
-    selector: process.Selector(Message(user_message)),
+    init_selector: process.Selector(Message(user_message)),
+    active_state: socket.ActiveState,
     handlers: Handlers(user_state, user_message),
-    server: socket.Endpoint,
-    state: user_state,
-    client: socket.Endpoint,
+    user_state: user_state,
   )
 }
 
 pub fn start_worker(argument: Argument(user_state, user_message)) {
   actor.new_with_initialiser(1000, fn(self) {
-    let Argument(
-      transport:,
-      socket:,
-      server:,
-      acceptor:,
-      active_state:,
-      handlers:,
-    ) = argument
+    let Argument(transport:, socket:, acceptor:, active_state:, handlers:) =
+      argument
     let monitor = process.monitor(acceptor)
 
     let selector =
@@ -150,9 +137,8 @@ pub fn start_worker(argument: Argument(user_state, user_message)) {
       socket:,
       active_state:,
       self:,
-      selector:,
+      init_selector: selector,
       handlers:,
-      server:,
       monitor:,
     )
     |> actor.initialised
@@ -167,9 +153,8 @@ pub fn start_worker(argument: Argument(user_state, user_message)) {
         socket:,
         active_state:,
         self:,
-        selector:,
+        init_selector:,
         handlers:,
-        server:,
         monitor:,
       ),
         Ready
@@ -178,35 +163,34 @@ pub fn start_worker(argument: Argument(user_state, user_message)) {
 
         case socket.handshake(transport, socket, socket.Milliseconds(10_000)) {
           Ok(socket) -> {
-            case socket.peername(transport, socket) {
-              Ok(client) -> {
+            let local = socket.sockname(transport, socket)
+            let peer = socket.peername(transport, socket)
+            case local, peer {
+              Ok(local), Ok(peer) -> {
                 use <- refresh_flow_control(transport, socket, active_state)
 
-                let connection = Connection(transport:, socket:, self:)
+                let connection = Connection(transport:, socket:, local:, peer:)
                 let #(state, user_selector) =
                   handlers.on_init(connection, process.new_selector())
 
-                let updated_selector =
+                let selector =
                   process.map_selector(user_selector, User)
-                  |> process.merge_selector(selector)
+                  |> process.merge_selector(init_selector)
 
                 Acknowledged(
-                  transport:,
-                  socket:,
-                  active_state:,
+                  connection:,
                   self:,
-                  selector:,
-                  state:,
+                  init_selector:,
+                  active_state:,
                   handlers:,
-                  server:,
-                  client:,
+                  user_state: state,
                 )
                 |> actor.continue
-                |> actor.with_selector(updated_selector)
+                |> actor.with_selector(selector)
               }
-              Error(_error) ->
+              _local, _peer ->
                 actor.stop_abnormal(
-                  "Failed to retrive the peername during initialisation",
+                  "Failed to retrive the sockname and peername during initialisation",
                 )
             }
           }
@@ -220,29 +204,19 @@ pub fn start_worker(argument: Argument(user_state, user_message)) {
       Initialised(..), AcceptorDown(_reason) -> actor.stop()
       Initialised(..), _remaining -> {
         logging.log(
-          logging.Alert,
+          logging.Warning,
           "Unexpected behaviour! Worker under \"Initialised\" received incomming data or user message.",
         )
 
         actor.continue(state)
       }
 
-      Acknowledged(
-        transport:,
-        socket:,
-        active_state:,
-        self:,
-        selector: _,
-        handlers:,
-        server: _,
-        state: user_state,
-        client: _,
-      ),
+      Acknowledged(connection:, active_state:, handlers:, user_state:, ..),
         Received(socket.Incoming(data))
       -> {
+        let Connection(transport:, socket:, ..) = connection
         use <- bump_flow_control(transport, socket, active_state)
 
-        let connection = Connection(transport:, socket:, self:)
         let rescued =
           exception.rescue(fn() {
             handlers.handler(connection, user_state, Incoming(data))
@@ -256,26 +230,31 @@ pub fn start_worker(argument: Argument(user_state, user_message)) {
           }
         }
       }
-      Acknowledged(state:, handlers:, ..), Received(socket.Disconnected) -> {
+      Acknowledged(user_state: state, handlers:, ..),
+        Received(socket.Disconnected)
+      -> {
         handlers.on_close(state)
         actor.stop()
       }
-      Acknowledged(state:, handlers:, ..), Received(socket.Failed(reason:)) -> {
+      Acknowledged(user_state: state, handlers:, ..),
+        Received(socket.Failed(reason:))
+      -> {
         handlers.on_close(state)
         { "Received socket failure: " <> socket.error_to_string(reason) }
         |> actor.stop_abnormal
       }
 
-      Acknowledged(transport:, socket:, active_state:, ..),
+      Acknowledged(
+        connection: Connection(transport:, socket:, ..),
+        active_state:,
+        ..,
+      ),
         Received(socket.Exhausted)
       -> {
         use <- refresh_flow_control(transport, socket, active_state)
         actor.continue(state)
       }
-      Acknowledged(transport:, socket:, self:, handlers:, state: user_state, ..),
-        User(message)
-      -> {
-        let connection = Connection(transport:, socket:, self:)
+      Acknowledged(connection:, handlers:, user_state:, ..), User(message) -> {
         let rescued =
           exception.rescue(fn() {
             handlers.handler(connection, user_state, UserMessage(message))
@@ -333,13 +312,13 @@ fn handle_next(
   next: Next(user_state, user_message),
 ) {
   case state, next {
-    Acknowledged(selector:, ..) as state,
+    Acknowledged(init_selector: selector, ..) as state,
       Continue(state: user_state, selector: user_selector, active_state:)
     -> {
       let state = case active_state {
         option.Some(active_state) ->
-          Acknowledged(..state, state: user_state, active_state:)
-        option.None -> Acknowledged(..state, state: user_state)
+          Acknowledged(..state, user_state: user_state, active_state:)
+        option.None -> Acknowledged(..state, user_state: user_state)
       }
 
       let next = actor.continue(state)
@@ -352,17 +331,17 @@ fn handle_next(
         option.None -> next
       }
     }
-    Acknowledged(state:, handlers:, ..), NormalStop -> {
+    Acknowledged(user_state: state, handlers:, ..), NormalStop -> {
       handlers.on_close(state)
       actor.stop()
     }
-    Acknowledged(state:, handlers:, ..), AbnormalStop(reason:) -> {
+    Acknowledged(user_state: state, handlers:, ..), AbnormalStop(reason:) -> {
       handlers.on_close(state)
       actor.stop_abnormal(reason)
     }
-    _, Continue(..) -> actor.continue(state)
-    _, NormalStop -> actor.stop()
-    _, AbnormalStop(reason:) -> actor.stop_abnormal(reason)
+    Initialised(..), Continue(..) -> actor.continue(state)
+    Initialised(..), NormalStop -> actor.stop()
+    Initialised(..), AbnormalStop(reason:) -> actor.stop_abnormal(reason)
   }
 }
 
