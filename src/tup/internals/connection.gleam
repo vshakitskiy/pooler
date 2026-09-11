@@ -1,9 +1,13 @@
 import exception
+import gleam/dynamic
+import gleam/erlang/atom
 import gleam/erlang/process
+import gleam/int
 import gleam/option
 import gleam/otp/actor
 import gleam/otp/factory_supervisor as factory
 import gleam/otp/supervision
+import gleam/string
 import logging
 import relay_supervisor as relay
 import tup/socket
@@ -18,13 +22,17 @@ pub type Relayed(user_state, user_message) {
 
 pub fn add_child(
   children: relay.Children(Nil),
+  shutdown_timeout: Int,
 ) -> relay.Children(
   factory.Supervisor(
     Argument(user_state, user_message),
     process.Subject(Message(user_message)),
   ),
 ) {
-  relay.Template(start:, child_type: supervision.Supervisor)
+  relay.Template(
+    start: fn(_nil) { start(shutdown_timeout) },
+    child_type: supervision.Supervisor,
+  )
   |> relay.child
   |> relay.providing(fn(_relayed) { Nil })
   |> relay.returning(fn(_relayed, factory) { factory })
@@ -48,6 +56,7 @@ pub type Handlers(user_state, user_message) {
     handler: fn(Connection, user_state, HandlerMessage(user_message)) ->
       Next(user_state, user_message),
     on_close: fn(user_state) -> Nil,
+    on_shutdown: fn(Connection, user_state) -> Nil,
   )
 }
 
@@ -76,7 +85,7 @@ pub type HandlerMessage(user_message) {
 }
 
 fn start(
-  _relayed: Nil,
+  shutdown_timeout: Int,
 ) -> Result(
   actor.Started(
     factory.Supervisor(
@@ -88,12 +97,14 @@ fn start(
 ) {
   factory.worker_child(start_worker)
   |> factory.restart_strategy(supervision.Temporary)
+  |> factory.timeout(ms: shutdown_timeout)
   |> factory.start
 }
 
 pub type Message(user_message) {
   Ready
-  AcceptorDown(process.ExitReason)
+  AcceptorDown(process.Down)
+  TrappedExit(process.ExitMessage)
   Received(socket.Message)
   User(user_message)
 }
@@ -102,6 +113,7 @@ type State(user_state, user_message) {
   Initialised(
     transport: socket.Transport,
     socket: socket.Socket,
+    parent: process.Pid,
     self: process.Subject(Message(user_message)),
     init_selector: process.Selector(Message(user_message)),
     active_state: socket.ActiveState,
@@ -110,6 +122,7 @@ type State(user_state, user_message) {
   )
   Acknowledged(
     connection: Connection,
+    parent: process.Pid,
     self: process.Subject(Message(user_message)),
     init_selector: process.Selector(Message(user_message)),
     active_state: socket.ActiveState,
@@ -120,6 +133,8 @@ type State(user_state, user_message) {
 
 pub fn start_worker(argument: Argument(user_state, user_message)) {
   actor.new_with_initialiser(1000, fn(self) {
+    process.trap_exits(True)
+
     let Argument(transport:, socket:, acceptor:, active_state:, handlers:) =
       argument
     let monitor = process.monitor(acceptor)
@@ -127,14 +142,14 @@ pub fn start_worker(argument: Argument(user_state, user_message)) {
     let selector =
       socket.selector(transport)
       |> process.map_selector(Received)
-      |> process.select_specific_monitor(monitor, fn(down) {
-        AcceptorDown(down.reason)
-      })
+      |> process.select_specific_monitor(monitor, AcceptorDown)
+      |> process.select_trapped_exits(TrappedExit)
       |> process.select(self)
 
     Initialised(
       transport:,
       socket:,
+      parent: parent(),
       active_state:,
       self:,
       init_selector: selector,
@@ -151,6 +166,7 @@ pub fn start_worker(argument: Argument(user_state, user_message)) {
       Initialised(
         transport:,
         socket:,
+        parent:,
         active_state:,
         self:,
         init_selector:,
@@ -179,6 +195,7 @@ pub fn start_worker(argument: Argument(user_state, user_message)) {
 
                 Acknowledged(
                   connection:,
+                  parent:,
                   self:,
                   init_selector:,
                   active_state:,
@@ -189,19 +206,26 @@ pub fn start_worker(argument: Argument(user_state, user_message)) {
                 |> actor.with_selector(selector)
               }
               _local, _peer ->
-                actor.stop_abnormal(
-                  "Failed to retrive the sockname and peername during initialisation",
-                )
+                "Failed to retrive the sockname and peername during initialisation"
+                |> dynamic.string
+                |> exit
             }
           }
           Error(error) ->
-            actor.stop_abnormal(
+            {
               "Failed to establish the TLS handshake: "
-              <> socket.error_to_string(error),
-            )
+              <> socket.error_to_string(error)
+            }
+            |> dynamic.string
+            |> exit
         }
       }
-      Initialised(..), AcceptorDown(_reason) -> actor.stop()
+      Initialised(..), AcceptorDown(_down) -> actor.stop()
+      // During "Initialised" state, the only message that we could have 
+      // possibly receive is from the connection supervisor.
+      Initialised(..), TrappedExit(process.ExitMessage(reason:, ..)) ->
+        exit_reason_to_dynamic(reason)
+        |> exit
       Initialised(..), _remaining -> {
         logging.log(
           logging.Warning,
@@ -225,23 +249,27 @@ pub fn start_worker(argument: Argument(user_state, user_message)) {
         case rescued {
           Ok(next) -> handle_next(state, next)
           Error(exception) -> {
-            handlers.on_close(user_state)
-            actor.stop_abnormal(exception_to_string(exception))
+            run_on_close(handlers, user_state)
+
+            exception_to_string(exception, in: "the handler")
+            |> dynamic.string
+            |> exit
           }
         }
       }
       Acknowledged(user_state: state, handlers:, ..),
         Received(socket.Disconnected)
       -> {
-        handlers.on_close(state)
+        run_on_close(handlers, state)
         actor.stop()
       }
       Acknowledged(user_state: state, handlers:, ..),
         Received(socket.Failed(reason:))
       -> {
-        handlers.on_close(state)
+        run_on_close(handlers, state)
         { "Received socket failure: " <> socket.error_to_string(reason) }
-        |> actor.stop_abnormal
+        |> dynamic.string
+        |> exit
       }
 
       Acknowledged(
@@ -263,8 +291,41 @@ pub fn start_worker(argument: Argument(user_state, user_message)) {
         case rescued {
           Ok(next) -> handle_next(state, next)
           Error(exception) -> {
-            handlers.on_close(user_state)
-            actor.stop_abnormal(exception_to_string(exception))
+            run_on_close(handlers, user_state)
+
+            exception_to_string(exception, in: "the handler")
+            |> dynamic.string
+            |> exit
+          }
+        }
+      }
+      Acknowledged(connection:, parent:, user_state:, handlers:, ..),
+        TrappedExit(process.ExitMessage(pid:, reason:))
+      -> {
+        let Connection(transport:, socket:, ..) = connection
+        case pid == parent, reason {
+          // The connection supervisor is taking this connection down.
+          True, reason -> {
+            run_on_shutdown(handlers, connection, user_state)
+
+            let _closed = socket.close(transport, socket)
+
+            run_on_close(handlers, user_state)
+
+            exit_reason_to_dynamic(reason)
+            |> exit
+          }
+
+          // A process the handler spawned finished. This message should not 
+          // affect the connection worker at all.
+          False, process.Normal -> actor.continue(state)
+
+          // A process the handler spawned crashed or was killed.
+          False, reason -> {
+            run_on_close(handlers, user_state)
+
+            exit_reason_to_dynamic(reason)
+            |> exit
           }
         }
       }
@@ -272,6 +333,22 @@ pub fn start_worker(argument: Argument(user_state, user_message)) {
     }
   })
   |> actor.start
+}
+
+@external(erlang, "tup_ffi", "parent")
+fn parent() -> process.Pid
+
+// erlang:exit never returns. Soooo the return type can be anything to match the 
+// caller needs.
+@external(erlang, "tup_ffi", "exit_with")
+fn exit(reason: dynamic.Dynamic) -> actor.Next(state, message)
+
+fn exit_reason_to_dynamic(reason: process.ExitReason) -> dynamic.Dynamic {
+  case reason {
+    process.Normal -> atom.to_dynamic(atom.create("normal"))
+    process.Killed -> atom.to_dynamic(atom.create("killed"))
+    process.Abnormal(reason:) -> reason
+  }
 }
 
 fn bump_flow_control(
@@ -302,7 +379,8 @@ fn refresh_flow_control(
     Ok(Nil) -> callback()
     Error(error) -> {
       { "Failed to follow the flow control: " <> socket.error_to_string(error) }
-      |> actor.stop_abnormal
+      |> dynamic.string
+      |> exit
     }
   }
 }
@@ -332,26 +410,140 @@ fn handle_next(
       }
     }
     Acknowledged(user_state: state, handlers:, ..), NormalStop -> {
-      handlers.on_close(state)
+      run_on_close(handlers, state)
       actor.stop()
     }
     Acknowledged(user_state: state, handlers:, ..), AbnormalStop(reason:) -> {
-      handlers.on_close(state)
-      actor.stop_abnormal(reason)
+      run_on_close(handlers, state)
+
+      dynamic.string(reason)
+      |> exit
     }
+    // This function should be called after the Ready message, so we assume these
+    // branches are unreachable.
     Initialised(..), Continue(..) -> actor.continue(state)
     Initialised(..), NormalStop -> actor.stop()
-    Initialised(..), AbnormalStop(reason:) -> actor.stop_abnormal(reason)
+    Initialised(..), AbnormalStop(reason:) ->
+      dynamic.string(reason)
+      |> exit
   }
 }
 
-fn exception_to_string(exception: exception.Exception) {
+fn run_on_shutdown(
+  handlers: Handlers(user_state, user_message),
+  connection: Connection,
+  state: user_state,
+) -> Nil {
+  case exception.rescue(fn() { handlers.on_shutdown(connection, state) }) {
+    Ok(Nil) -> Nil
+    Error(exception) ->
+      logging.log(
+        logging.Error,
+        "The connection was shut down without sending its goodbye. "
+          <> exception_to_string(exception, in: "on_shutdown"),
+      )
+  }
+}
+
+fn run_on_close(
+  handlers: Handlers(user_state, user_message),
+  state: user_state,
+) -> Nil {
+  case exception.rescue(fn() { handlers.on_close(state) }) {
+    Ok(Nil) -> Nil
+    Error(exception) ->
+      logging.log(
+        logging.Error,
+        "The connection was closed without finishing its cleanup. "
+          <> exception_to_string(exception, in: "on_close"),
+      )
+  }
+}
+
+/// Describe an exception raised by user code in a way the actual error reaches 
+/// the log or exit reason.
+/// The runtime error Gleam raises for `panic`, `todo`, `let assert` and
+/// `assert`.
+type GleamError {
+  GleamError(
+    kind: GleamErrorKind,
+    message: String,
+    module: String,
+    function: String,
+    file: String,
+    line: Int,
+    /// The value that did not match, for `let assert`.
+    value: option.Option(dynamic.Dynamic),
+  )
+}
+
+type GleamErrorKind {
+  Panic
+  Todo
+  LetAssert
+  Assert
+}
+
+@external(erlang, "tup_ffi", "gleam_error")
+fn gleam_error(error: dynamic.Dynamic) -> Result(GleamError, Nil)
+
+/// What Erlang code raised in Erlang syntax.
+@external(erlang, "tup_ffi", "erlang_term_to_string")
+fn erlang_term_to_string(term: dynamic.Dynamic) -> String
+
+fn gleam_error_to_string(error: GleamError, in location: String) -> String {
+  let GleamError(kind:, message:, module:, function:, file:, line:, value:) =
+    error
+  let happened = case kind {
+    Panic -> " panicked in "
+    Todo -> " reached a todo in "
+    LetAssert -> " failed a let assert in "
+    Assert -> " failed an assert in "
+  }
+  let unmatched = case value {
+    option.Some(value) -> " Unmatched value: " <> string.inspect(value)
+    option.None -> ""
+  }
+  location
+  <> happened
+  <> module
+  <> "."
+  <> function
+  <> " ("
+  <> file
+  <> ":"
+  <> int.to_string(line)
+  <> "): "
+  <> message
+  <> unmatched
+}
+
+fn exception_to_string(
+  exception: exception.Exception,
+  in location: String,
+) -> String {
   case exception {
-    exception.Errored(_dynamic) ->
-      "An error was raised in the handler. This can be caused by calling the \"echo\", \"panic\", erlang:error/1 function or some other runtime error."
-    exception.Thrown(_dynamic) ->
-      "A value was thrown in the handler. This can be caused by calling the erlang:throw/1 function."
-    exception.Exited(_dynamic) ->
-      "A process exited in the handler. This can be caused by calling the erlang:exit/1 function."
+    exception.Errored(error) ->
+      case gleam_error(error) {
+        Ok(gleam_error) -> gleam_error_to_string(gleam_error, in: location)
+        Error(Nil) ->
+          "An error was raised in "
+          <> location
+          <> ": "
+          <> erlang_term_to_string(error)
+          <> ". This can be caused by calling Erlang code that fails."
+      }
+    exception.Thrown(value) ->
+      "A value was thrown in "
+      <> location
+      <> ": "
+      <> erlang_term_to_string(value)
+      <> "."
+    exception.Exited(reason) ->
+      "An exit was raised in "
+      <> location
+      <> ": "
+      <> erlang_term_to_string(reason)
+      <> "."
   }
 }

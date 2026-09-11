@@ -8,21 +8,13 @@ pub fn main() -> Nil {
   logging.set_level(logging.Debug)
   logging.configure()
 
-  // TODO:
-  // server endpoint outside the acceptor?
-  // draining mechanism?
-  // clean docs?
-
-  let subject = process.new_subject()
+  let name = process.new_name("tup")
 
   let assert Ok(_started) =
     tup.new(
-      on_init: fn(_connection, selector) {
-        let self = process.new_subject()
-        process.send(subject, self)
-        #(1, process.select(selector, self))
-      },
+      on_init: fn(_connection, selector) { #(1, selector) },
       handler: fn(connection, state, message) {
+        panic
         echo message
           as { "Incomming message! (" <> int.to_string(state) <> ")" }
         let data = case message {
@@ -36,14 +28,18 @@ pub fn main() -> Nil {
       },
       on_close: fn(state) {
         echo "Connection closed! (" <> int.to_string(state) <> ")"
+        panic
         Nil
       },
     )
+    |> tup.named(name)
     |> tup.listening(on: tup.Tcp(interface: "127.0.0.1", port: 3000))
     |> tup.start
 
-  let subject = process.receive_forever(subject)
-  process.send(subject, 10_278)
+  echo tup.listen_endpoint(name, within: 1000)
+
+  // let subject = process.receive_forever(subject)
+  // process.send(subject, 10_278)
 
   process.sleep_forever()
 }

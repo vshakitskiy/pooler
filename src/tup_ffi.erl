@@ -2,7 +2,28 @@
 
 -include_lib("kernel/include/file.hrl").
 
--export([parse_address/1, unlink_stale_socket/1, read_file/1]).
+-export([parent/0, exit_with/1, gleam_error/1, erlang_term_to_string/1, parse_address/1, unlink_stale_socket/1, read_file/1,
+         child_pid/2, terminate_child/2, restart_child/2, active_children/1, monotonic_milliseconds/0]).
+
+parent() -> 
+  {parent, Pid} = erlang:process_info(self(), parent), 
+  Pid.
+
+exit_with(Reason) -> erlang:exit(Reason).
+
+gleam_error(#{gleam_error := Kind, message := Message, module := Module,
+              function := Function, file := File, line := Line} = Error)
+  when Kind =:= panic; Kind =:= todo; Kind =:= let_assert; Kind =:= assert ->
+  Value = case Error of
+    #{value := Unmatched} -> {some, Unmatched};
+    _NoValue -> none
+  end,
+  {ok, {gleam_error, Kind, Message, Module, Function, File, Line, Value}};
+gleam_error(_NotGleam) ->
+  {error, nil}.
+
+erlang_term_to_string(Term) ->
+  unicode:characters_to_binary(io_lib:format("~0tp", [Term])).
 
 parse_address(Address) ->
   case inet:parse_address(binary_to_list(Address)) of
@@ -49,3 +70,42 @@ reason(Reason) when is_atom(Reason) ->
   atom_to_binary(Reason, utf8);
 reason(Reason) ->
   unicode:characters_to_binary(io_lib:format("~p", [Reason])).
+
+child_pid(Supervisor, Id) ->
+  try supervisor:which_children(Supervisor) of
+    Children ->
+      case lists:keyfind(Id, 1, Children) of
+        {Id, Pid, _Type, _Modules} when is_pid(Pid) -> {ok, Pid};
+        _NotRunning -> {error, nil}
+      end
+  catch
+    exit:_Reason -> {error, nil}
+  end.
+
+terminate_child(Supervisor, Id) ->
+  try supervisor:terminate_child(Supervisor, Id) of
+    ok -> {ok, nil};
+    {error, not_found} -> {error, nil}
+  catch
+    exit:_Reason -> {error, nil}
+  end.
+
+restart_child(Supervisor, Id) ->
+  try supervisor:restart_child(Supervisor, Id) of
+    {ok, _Pid} -> {ok, nil};
+    {ok, _Pid, _Info} -> {ok, nil};
+    {error, running} -> {ok, nil};
+    {error, restarting} -> {ok, nil};
+    {error, _Reason} -> {error, nil}
+  catch
+    exit:_Reason -> {error, nil}
+  end.
+
+active_children(Supervisor) ->
+  try supervisor:count_children(Supervisor) of
+    Counts -> {ok, proplists:get_value(active, Counts, 0)}
+  catch
+    exit:_Reason -> {error, nil}
+  end.
+
+monotonic_milliseconds() -> erlang:monotonic_time(millisecond).

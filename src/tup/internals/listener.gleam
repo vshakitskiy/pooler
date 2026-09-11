@@ -1,6 +1,9 @@
+import gleam/dynamic
+import gleam/erlang/process
 import gleam/option
 import gleam/otp/actor
 import gleam/otp/supervision
+import gleam/result
 import relay_supervisor as relay
 import tup/internals/file
 import tup/socket
@@ -23,6 +26,14 @@ pub fn add_child(children: relay.Children(Nil), argument: Argument) {
   |> relay.child
   |> relay.providing(fn(_nil) { argument })
   |> relay.add(children, _)
+}
+
+pub opaque type Message {
+  GetEndpoint(reply: process.Subject(socket.Endpoint))
+}
+
+fn control_subject(listener: process.Pid) {
+  process.unsafely_create_subject(listener, dynamic.string("tup_listener"))
 }
 
 fn start(argument: Argument) {
@@ -53,7 +64,14 @@ fn start(argument: Argument) {
       Ok(#(transport, socket)) -> {
         case socket.sockname_listener(transport, socket) {
           Ok(local) -> {
+            let self = control_subject(process.self())
+
+            let selector =
+              process.new_selector()
+              |> process.select(for: self)
+
             actor.initialised(local)
+            |> actor.selecting(selector)
             |> actor.returning(Relayed(transport:, socket:))
             |> Ok
           }
@@ -69,7 +87,30 @@ fn start(argument: Argument) {
         )
     }
   })
+  |> actor.on_message(fn(local, message) {
+    let GetEndpoint(reply) = message
+    process.send(reply, local)
+    actor.continue(local)
+  })
   |> actor.start
+}
+
+pub fn endpoint(listener: process.Pid, within: Int) {
+  let monitor = process.monitor(listener)
+  let subject = control_subject(listener)
+  let reply = process.new_subject()
+  process.send(subject, GetEndpoint(reply:))
+
+  let endpoint =
+    process.new_selector()
+    |> process.select_specific_monitor(monitor, fn(_down) { Error(Nil) })
+    |> process.select_map(for: reply, mapping: fn(reply) { Ok(reply) })
+    |> process.selector_receive(within:)
+    |> result.flatten
+
+  process.demonitor_process(monitor:)
+
+  endpoint
 }
 
 pub type SocketPathError {

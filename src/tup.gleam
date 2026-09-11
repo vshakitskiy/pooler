@@ -8,11 +8,13 @@ import gleam/otp/actor
 import gleam/otp/supervision
 import gleam/result
 import gleam/string
+import logging
 import relay_supervisor as relay
 import tup/internals/connection
 import tup/internals/file
 import tup/internals/listener
 import tup/internals/pool
+import tup/internals/tree
 import tup/socket
 
 /// An IPv4 or IPv6 address.
@@ -201,13 +203,24 @@ fn from_internal_message(
   }
 }
 
+pub type Server
+
+/// How long connections get to finish their work once the server starts
+/// shutting down.
+type ShutdownTimeout {
+  ShutdownAfter(milliseconds: Int)
+  ShutdownNever
+}
+
 pub opaque type Builder(user_state, user_message) {
   Builder(
     address: Address,
     tls: option.Option(Tls),
     active_state: socket.ActiveState,
     pool_size: Int,
+    shutdown_timeout: ShutdownTimeout,
     handlers: connection.Handlers(user_state, user_message),
+    name: option.Option(process.Name(Server)),
   )
 }
 
@@ -223,6 +236,7 @@ pub fn new(
     tls: option.None,
     active_state: socket.Once,
     pool_size: 20,
+    shutdown_timeout: ShutdownAfter(15_000),
     handlers: connection.Handlers(
       on_init: fn(connection, selector) {
         let connection = from_internal_connection(connection)
@@ -235,12 +249,47 @@ pub fn new(
         |> to_internal_next
       },
       on_close:,
+      on_shutdown: fn(_connection, _state) { Nil },
     ),
+    name: option.None,
   )
 }
 
 pub fn pool_size(builder: Builder(user_state, user_message), pool_size: Int) {
   Builder(..builder, pool_size:)
+}
+
+/// How long each connection gets to finish when the server shuts down before
+/// it is killed. A connection still running at the deadline is killed without
+/// `on_shutdown` or `on_close` completing. Defaults to 15 seconds. Must not be
+/// negative.
+pub fn shutdown_timeout(
+  builder: Builder(user_state, user_message),
+  milliseconds: Int,
+) {
+  Builder(..builder, shutdown_timeout: ShutdownAfter(milliseconds))
+}
+
+/// Wait for every connection to finish when the server shuts down, however
+/// long that takes. A connection that never finishes keeps the shutdown from
+/// ever completing, so only use this when every handler is sure to return.
+pub fn infinite_shutdown_timeout(builder: Builder(user_state, user_message)) {
+  Builder(..builder, shutdown_timeout: ShutdownNever)
+}
+
+pub fn on_shutdown(
+  builder: Builder(user_state, user_message),
+  on_shutdown: fn(Connection, user_state) -> Nil,
+) {
+  let on_shutdown = fn(connection, state) {
+    let connection = from_internal_connection(connection)
+    on_shutdown(connection, state)
+  }
+
+  Builder(
+    ..builder,
+    handlers: connection.Handlers(..builder.handlers, on_shutdown:),
+  )
 }
 
 pub type Address {
@@ -364,15 +413,114 @@ pub fn with_tls(builder: Builder(user_state, user_message), tls: Tls) {
   Builder(..builder, tls: option.Some(tls))
 }
 
+pub fn named(
+  builder: Builder(user_state, user_message),
+  name: process.Name(Server),
+) {
+  Builder(..builder, name: option.Some(name))
+}
+
+pub fn listen_endpoint(
+  name: process.Name(Server),
+  within timeout: Int,
+) -> Result(Endpoint, Nil) {
+  use root <- result.try(process.named(name))
+  use pool <- result.try(tree.child(root, tree.acceptor_pool))
+  use listener <- result.try(tree.child(pool, tree.listener))
+  listener.endpoint(listener, timeout)
+  |> result.map(with: from_socket_endpoint)
+}
+
+// TODO: suspend & resume
+// pub type DrainError {
+//   NotRunning
+//   TimedOut(remaining: Int)
+// }
+
+// pub fn drain(
+//   name: process.Name(Server),
+//   within timeout: Int,
+// ) -> Result(Nil, DrainError) {
+//   case process.named(name) {
+//     Ok(root) -> {
+//       case tree.terminate_child(root, tree.acceptor_pool) {
+//         Ok(Nil) ->
+//           do_drain(root:, deadline: monotonic_milliseconds() + timeout, seen: 0)
+//         Error(Nil) -> Error(NotRunning)
+//       }
+//     }
+//     Error(Nil) -> Error(NotRunning)
+//   }
+// }
+
+// fn do_drain(
+//   root root: process.Pid,
+//   deadline deadline: Int,
+//   seen seen: Int,
+// ) -> Result(Nil, DrainError) {
+//   case process.is_alive(root) {
+//     True -> {
+//       case tree.child(root, tree.acceptor_pool) {
+//         Ok(_pid) -> {
+//           let _suspended = tree.terminate_child(root, tree.acceptor_pool)
+//           Nil
+//         }
+//         Error(Nil) -> Nil
+//       }
+
+//       let count = case tree.child(root, tree.connection_supervisor) {
+//         Ok(factory) -> tree.active_children(factory)
+//         Error(Nil) -> Error(Nil)
+//       }
+
+//       let now = monotonic_milliseconds()
+//       case count {
+//         Ok(0) -> Ok(Nil)
+//         Ok(remaining) if now >= deadline -> Error(TimedOut(remaining:))
+//         Error(Nil) if now >= deadline -> Error(TimedOut(remaining: seen))
+//         Ok(remaining) -> wait_then(root, deadline, now, remaining)
+//         Error(Nil) -> wait_then(root, deadline, now, seen)
+//       }
+//     }
+//     False -> Error(NotRunning)
+//   }
+// }
+
+// const drain_poll_interval = 100
+
+// fn wait_then(
+//   root: process.Pid,
+//   deadline: Int,
+//   now: Int,
+//   seen: Int,
+// ) -> Result(Nil, DrainError) {
+//   int.min(drain_poll_interval, deadline - now)
+//   |> process.sleep
+
+//   do_drain(root, deadline:, seen:)
+// }
+
+// @external(erlang, "tup_ffi", "monotonic_milliseconds")
+// fn monotonic_milliseconds() -> Int
+
 pub fn supervised(builder: Builder(user_state, user_message)) {
   use <- supervision.supervisor
   start(builder)
 }
 
 pub fn start(builder: Builder(user_state, user_message)) {
-  let Builder(address:, tls:, active_state:, pool_size:, handlers:) = builder
+  let Builder(
+    address:,
+    tls:,
+    active_state:,
+    pool_size:,
+    shutdown_timeout:,
+    handlers:,
+    name:,
+  ) = builder
 
   use pool_size <- try_pool_size(pool_size)
+  use shutdown_timeout <- try_shutdown_timeout(shutdown_timeout)
 
   use address <- result.try(case address {
     Tcp(interface:, port:) -> {
@@ -390,6 +538,8 @@ pub fn start(builder: Builder(user_state, user_message)) {
   let listener_argument = listener.Argument(address:, tls:)
   let pool_argument = pool.Argument(pool_size:, active_state:, handlers:)
 
+  use <- try_name(name)
+
   // The current supervision tree design is:
   //
   // ┆
@@ -397,9 +547,9 @@ pub fn start(builder: Builder(user_state, user_message)) {
   // └─ Root Supervisor, RestForOne outer relay_supervisor
   //    ├─ Connection Supervisor, OneForOne Transient factory_supervisor
   //    │  └─ Spawned Connection, worker N
-  //    └─ Inner relay, RestForOne inner relay_supervisor
+  //    └─ Acceptor Pool, RestForOne inner relay_supervisor
   //       ├─ Listener, worker
-  //       └─ Acceptor Pool, OneForOne static_supervisor
+  //       └─ Pool, OneForOne static_supervisor
   //         ├─ Acceptor, worker 1
   //         ├─ Acceptor, worker 2
   //         ┆
@@ -447,10 +597,39 @@ pub fn start(builder: Builder(user_state, user_message)) {
   //   can at least provide some interval for reading incomming OTP messages.
   //
   relay.new(fn(children) {
-    connection.add_child(children)
+    case name {
+      option.Some(name) -> {
+        case process.register(process.self(), name) {
+          Ok(Nil) -> Nil
+          Error(Nil) ->
+            logging.log(
+              logging.Error,
+              "Failed to bind the acceptor pool to the name provided! The name has already been registered.",
+            )
+        }
+      }
+      option.None -> Nil
+    }
+
+    connection.add_child(children, shutdown_timeout)
     |> pool.add_child(listener_argument, pool_argument)
   })
   |> relay.start
+}
+
+fn try_shutdown_timeout(
+  shutdown_timeout: ShutdownTimeout,
+  callback: fn(Int) -> Result(a, actor.StartError),
+) -> Result(a, actor.StartError) {
+  case shutdown_timeout {
+    ShutdownAfter(milliseconds:) if milliseconds < 0 ->
+      Error(actor.InitFailed(
+        "Provided shutdown timeout is negative. Use infinite_shutdown_timeout to wait for connections without a limit.",
+      ))
+    ShutdownAfter(milliseconds:) -> callback(milliseconds)
+    // gleam_otp turns a negative child shutdown time into `infinity`
+    ShutdownNever -> callback(-1)
+  }
 }
 
 fn try_pool_size(
@@ -697,5 +876,23 @@ fn try_pem_trust_store(
     [] -> Error(actor.InitFailed(no_trust_store))
     certificates ->
       callback([socket.CertificateAuthorities(certificates), ..options])
+  }
+}
+
+fn try_name(
+  name: option.Option(process.Name(Server)),
+  callback: fn() -> Result(a, actor.StartError),
+) -> Result(a, actor.StartError) {
+  case name {
+    option.Some(name) ->
+      case process.named(name) {
+        Ok(_pid) ->
+          "name provided to the acceptor pool is already registered"
+          |> actor.InitFailed
+          |> Error
+        Error(Nil) -> callback()
+      }
+
+    option.None -> callback()
   }
 }
