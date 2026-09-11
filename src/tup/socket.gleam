@@ -1,4 +1,5 @@
-//// Bindings to the Erlang socket modules the acceptor pool is built on.
+//// Bindings to the Erlang modules for accepting and working with TCP and TLS
+//// connections.
 ////
 //// - [`gen_tcp`](https://www.erlang.org/doc/apps/kernel/gen_tcp.html)
 //// - [`inet`](https://www.erlang.org/doc/apps/kernel/inet.html)
@@ -14,14 +15,14 @@ import gleam/option
 import gleam/result
 import gleam/string
 
-/// A socket connections are accepted from.
+/// A socket that accepts connections.
 pub type ListenSocket
 
 /// An accepted connection.
 pub type Socket
 
-/// Which Erlang module a socket belongs to. Every other function here takes
-/// it.
+/// Which Erlang module a socket belongs to. Returned by `listen` and `listen_tls`
+/// and passed to everything else.
 pub type Transport {
   /// Plain TCP.
   Tcp
@@ -37,15 +38,15 @@ pub type IpAddress {
   Ipv6(Int, Int, Int, Int, Int, Int, Int, Int)
 }
 
-/// The address the socket or connected peer is bound to.
+/// Where a socket or its peer is bound.
 pub type Endpoint {
-  /// An address and a port on a TCP socket.
+  /// An address and port.
   TcpEndpoint(ip_address: IpAddress, port: Int)
   /// The path of a Unix domain socket.
   UnixEndpoint(path: String)
 }
 
-/// How long a call waits.
+/// How long a blocking call may wait.
 pub type Timeout {
   /// Give up after this many milliseconds.
   Milliseconds(Int)
@@ -53,9 +54,9 @@ pub type Timeout {
   Never
 }
 
-/// Which direction of a connection to close.
+/// Which direction of a connection `shutdown` closes.
 pub type ShutdownMode {
-  /// Stop receiving. Data the peer sends is discarded.
+  /// Stop receiving. Anything the peer sends from now on is discarded.
   Read
   /// Stop sending. The peer sees the end of the stream.
   Write
@@ -63,11 +64,12 @@ pub type ShutdownMode {
   ReadWrite
 }
 
-/// Why a socket call failed.
+/// Why a call failed. The variants starting with `E` are the operating 
+/// system's errno values under their usual names.
 pub type SocketError {
   /// The socket is closed.
   Closed
-  /// The call ran out of time.
+  /// The call's timeout ran out.
   Timeout
   /// The calling process does not own the socket.
   NotOwner
@@ -75,16 +77,15 @@ pub type SocketError {
   SystemLimit
   /// The call does not exist on this transport.
   Unsupported
-  /// The handshake agreed no ALPN protocol.
+  /// No ALPN protocol was agreed.
   NotNegotiated
   /// The peer sent no certificate.
   NoPeerCertificate
   /// A TLS alert sent by the peer or raised locally. `detail` is Erlang's
-  /// description of it.
+  /// wording of it.
   TlsAlert(description: AlertDescription, detail: String)
-  /// A `TlsOption` was rejected before the socket was opened. `option` names
-  /// the Erlang option and `detail` says what was wrong with it. Always a
-  /// configuration mistake rather than a runtime condition.
+  /// A `TlsOption` was rejected before the socket opened. This always indicates 
+  /// a configuration mistake.
   BadTlsOption(option: String, detail: String)
   /// Permission denied.
   Eacces
@@ -94,7 +95,7 @@ pub type SocketError {
   Eaddrnotavail
   /// The address family is not supported.
   Eafnosupport
-  /// The operation would block and the socket is not blocking.
+  /// The operation would block on a non-blocking socket.
   Eagain
   /// An operation is already in progress on the socket.
   Ealready
@@ -108,7 +109,7 @@ pub type SocketError {
   Econnreset
   /// The remote host is down.
   Ehostdown
-  /// There is no route to the remote host.
+  /// No route to the remote host.
   Ehostunreach
   /// The operation is in progress.
   Einprogress
@@ -156,7 +157,7 @@ pub type SocketError {
   Eprototype
   /// The connection timed out.
   Etimedout
-  /// The operation would block, the same as `Eagain` on most systems.
+  /// The operation would block. The same as `Eagain` on most systems.
   Ewouldblock
   /// The inet driver was given a bad port.
   Exbadport
@@ -166,7 +167,7 @@ pub type SocketError {
   Failure(reason: dynamic.Dynamic)
 }
 
-/// The description carried by a TLS alert, as registered in
+/// What a TLS alert says, as listed in
 /// [RFC 8446](https://www.rfc-editor.org/rfc/rfc8446#section-6.2).
 pub type AlertDescription {
   /// The sender is closing the connection cleanly.
@@ -177,9 +178,9 @@ pub type AlertDescription {
   BadRecordMac
   /// A record was longer than the protocol allows.
   RecordOverflow
-  /// No acceptable set of security parameters was agreed.
+  /// No set of security parameters could be agreed.
   HandshakeFailure
-  /// The certificate was corrupt.
+  /// The certificate is corrupt.
   BadCertificate
   /// The certificate is of an unsupported type.
   UnsupportedCertificate
@@ -191,9 +192,9 @@ pub type AlertDescription {
   CertificateUnknown
   /// A handshake field was out of range or inconsistent.
   IllegalParameter
-  /// The certificate chain led to no trusted authority.
+  /// The certificate chain does not end at a trusted authority.
   UnknownCa
-  /// A valid certificate was refused access.
+  /// The certificate is valid but was refused access.
   AccessDenied
   /// A message could not be decoded.
   DecodeError
@@ -213,52 +214,54 @@ pub type AlertDescription {
   NoRenegotiation
   /// A required extension was absent.
   MissingExtension
-  /// An extension was returned that the peer never offered.
+  /// The peer returned an extension that was never offered.
   UnsupportedExtension
   /// The certificate could not be fetched.
   CertificateUnobtainable
   /// The server does not serve the requested SNI name.
   UnrecognizedName
-  /// The OCSP response was invalid.
+  /// The OCSP response is invalid.
   BadCertificateStatusResponse
   /// The pre shared key identity is not known.
   UnknownPskIdentity
-  /// The client sent no certificate when one was required.
+  /// A certificate was required and the client sent none.
   CertificateRequired
-  /// The ALPN lists had no protocol in common.
+  /// The ALPN lists have no protocol in common.
   NoApplicationProtocol
-  /// An alert value not named above.
+  /// An alert with no fixed shape.
   UnknownAlert
 }
 
-/// How received data reaches the socket's owner. Every mode but `Passive`
-/// delivers `Message`s.
+/// Whether received data is delivered as `Message`s or read with `receive`.
+/// 
+/// `Once` and `Packets` provides a flow control: the socket goes back to 
+/// `Passive` on its own and that makes a fast peer not flooding the owner's 
+/// mailbox.
 pub type ActiveState {
-  /// Nothing is delivered, the socket is read instead.
+  /// Nothing is delivered. Read the socket with `receive`.
   Passive
   /// Everything is delivered with no flow control.
   Always
-  /// One message then `Passive` again.
+  /// One message then switching to `Passive`.
   Once
-  /// `count` messages then `Passive` again.
+  /// `count` amount of messages then switching to `Passive`.
   Packets(count: Int)
 }
 
-/// The local address to bind to.
+/// Which local address a listen socket binds.
 pub type Interface {
-  /// The interface that owns this address.
+  /// The interface that has this address.
   Address(IpAddress)
-  /// Every interface on the host. The default.
+  /// Every interface. The default.
   Any
   /// The loopback interface only.
   Loopback
-  /// The path of a Unix domain socket. `port` has to be `0` and the socket
-  /// has to be in the `Local` family.
+  /// The path of a Unix domain socket. Needs `port` to be `0` and 
+  /// `Family(Local)`.
   Local(String)
 }
 
 /// The address family of a socket.
-///
 pub type AddressFamily {
   /// IPv4.
   Inet
@@ -266,32 +269,32 @@ pub type AddressFamily {
   Inet6
 }
 
-/// The options an inet socket takes on either transport. The ones marked
-/// listen only are fixed when the socket is opened, the rest can be changed on
-/// an open connection.
+/// Options for either transport. The ones marked listen only are fixed when
+/// the socket opens. The rest can also be changed later with `set_options`.
 ///
 /// Sockets are always opened in binary mode and deliver bytes unframed.
 pub type TcpOption {
   /// How received data reaches the owner.
   Active(ActiveState)
-  /// Allow rebinding a port that is still in `TIME_WAIT`.
+  /// Allow binding a port that is still in `TIME_WAIT`. That allows a restarted
+  /// server to reclaim its port.
   ReuseAddress(Bool)
-  /// Let several sockets bind the same port. OTP 26 and later.
+  /// Let several sockets bind the same port.
   ReusePort(Bool)
-  /// Send small writes at once instead of coalescing them.
+  /// Send small writes at once instead of coalescing them (Nagle's algorithm).
   NoDelay(Bool)
-  /// Queue writes for the driver rather than sending them immediately.
+  /// Let the driver queue writes rather than sending each one immediately.
   DelaySend(Bool)
   /// Send periodic TCP keepalive probes.
   KeepAlive(Bool)
-  /// How long a close blocks flushing unsent data.
+  /// Whether `close` blocks to flush unsent data and for how long.
   Linger(enabled: Bool, seconds: Int)
   /// How long a send waits on a peer that is not reading.
   SendTimeout(Timeout)
   /// Close the socket when a send times out.
   SendTimeoutClose(Bool)
-  /// When false the socket can still be sent on after the peer has closed its
-  /// end.
+  /// Whether the socket closes when the peer closes its end. `False` keeps
+  /// the write side usable after the peer has finished sending.
   ExitOnClose(Bool)
   /// Report a reset as `Econnreset` instead of a plain close.
   ShowConnectionReset(Bool)
@@ -301,19 +304,19 @@ pub type TcpOption {
   ReceiveBuffer(Int)
   /// The kernel send buffer in bytes.
   SendBuffer(Int)
-  /// The send queue size at which the port is considered busy.
+  /// The send queue size at which the port counts as busy.
   HighWatermark(Int)
-  /// The send queue size at which the port is considered idle again.
+  /// The send queue size at which the port counts as idle again.
   LowWatermark(Int)
   /// `HighWatermark` for the driver's message queue.
   HighMessageQueueWatermark(Int)
   /// `LowWatermark` for the driver's message queue.
   LowMessageQueueWatermark(Int)
-  /// How many connections the kernel queues. Listen only.
+  /// How many pending connections the kernel queues. Listen only.
   Backlog(Int)
-  /// The address to bind. Listen only.
+  /// The local address to bind. Listen only.
   BindAddress(Interface)
-  /// The family which has to agree with `BindAddress`. Listen only.
+  /// The address family which has to match `BindAddress`. Listen only.
   Family(AddressFamily)
   /// Refuse IPv4 mapped addresses on an IPv6 socket. Listen only.
   Ipv6Only(Bool)
@@ -321,11 +324,11 @@ pub type TcpOption {
   FileDescriptor(Int)
 }
 
-/// Whether the peer's certificate is checked.
+/// Whether the server asks the client for a certificate.
 pub type VerifyMode {
-  /// No certificate is requested from the client.
+  /// No certificate is requested.
   VerifyNone
-  /// The client's certificate is requested and checked.
+  /// A certificate is requested and checked.
   VerifyPeer
 }
 
@@ -338,22 +341,21 @@ pub type TlsVersion {
   Tls12
 }
 
-/// Whether the peer's certificate is checked against a certificate
-/// revocation list. Only meaningful alongside `Verify(VerifyPeer)`.
+/// Whether a verified certificate is also checked against a revocation list.
+/// Only applies with `Verify(VerifyPeer)`.
 pub type CrlMode {
   /// No revocation check.
   CrlDisabled
   /// Check every certificate in the chain. A list that cannot be fetched
   /// fails the connection.
   CrlWholeChain
-  /// Check the peer's own certificate and no issuer above it.
+  /// Check the peer's own certificate only.
   CrlPeerOnly
-  /// Check what can be checked. A list that cannot be fetched is not a
-  /// failure.
+  /// Check what can be checked. A list that cannot be fetched is ignored.
   CrlBestEffort
 }
 
-/// A group the key exchange may use, either an elliptic curve or a finite
+/// A group the key exchange may use. Either an elliptic curve or a finite
 /// field Diffie-Hellman group from
 /// [RFC 7919](https://www.rfc-editor.org/rfc/rfc7919).
 pub type KeyExchangeGroup {
@@ -379,13 +381,13 @@ pub type KeyExchangeGroup {
   Ffdhe8192
 }
 
-/// The TLS 1.3 session resumption the server offers.
+/// Which TLS 1.3 session resumption the server offers.
 pub type TicketMode {
-  /// No resumption.
+  /// None.
   TicketsDisabled
   /// The server keeps the session state.
   Stateful
-  /// The state travels in the ticket.
+  /// The session state travels inside the ticket.
   Stateless
 }
 
@@ -407,22 +409,23 @@ pub type LogLevel {
   LogEverything
 }
 
-/// One certificate chain with the key of the certificate it ends in.
+/// A certificate chain together with the private key of the certificate it
+/// ends in.
 pub type CertificateKey {
-  /// PEM files on disk. `password` is the key file's password when the key is
+  /// PEM files on disk. `password` decrypts the key file when it is
   /// encrypted.
   CertificateFiles(
     certificate_file: String,
     key_file: String,
     password: option.Option(String),
   )
-  /// DER already in memory, the server's own certificate first and each
-  /// issuer after it.
+
+  /// DER in memory. The server's own certificate first and then each issuer.
   CertificateChain(chain: List(BitArray), key: PrivateKey)
 }
 
-/// A DER encoded private key named after the ASN.1 structure it was encoded
-/// as. An encrypted key has to be decrypted before it is used here.
+/// A DER encoded private key named after the ASN.1 structure it is encoded
+/// as. Encrypted keys have to be decrypted before they get here.
 pub type PrivateKey {
   /// A PKCS #1 `RSAPrivateKey`.
   RsaPrivateKey(BitArray)
@@ -440,54 +443,53 @@ pub type PemError {
   NoPrivateKey
   /// The key is encrypted and no password was given.
   EncryptedPrivateKey
-  /// The key is encrypted and the password given does not decrypt it.
+  /// The password does not decrypt the key.
   WrongPassword
 }
 
 /// The TLS options a listener takes alongside its `TcpOption`s.
 pub type TlsOption {
-  /// The server's own certificates and keys. An empty list opens a socket
-  /// that accepts connections and then fails every handshake, so give at
-  /// least one entry.
+  /// The server's own certificates and keys. It is required to have at least 
+  /// one specified since an empty list opens a socket that accepts connections 
+  /// and then fails every handshake.
   CertificateKeys(List(CertificateKey))
-  /// A certificate to serve in place of `CertificateKeys` when the client
-  /// asks for a particular name through SNI, keyed by that name.
+  /// Certificates to serve instead of `CertificateKeys` when the client asks
+  /// for a particular name through SNI keyed by that name.
   ServerNameCertificates(List(#(String, CertificateKey)))
   /// A PEM file of trusted certificate authorities.
   CertificateAuthorityFile(String)
-  /// Trusted certificate authorities as DER certificates.
+  /// Trusted certificate authorities as DER.
   CertificateAuthorities(List(BitArray))
-  /// Whether the server tells the client which authorities it accepts while
-  /// asking for a certificate. Distinct from `CertificateAuthorities`, which
-  /// is the set the server itself trusts. TLS 1.3 only.
+  /// Whether the server tells the client which authorities it accepts when
+  /// asking for a certificate. TLS 1.3 only.
   SendCertificateAuthorities(Bool)
-  /// Whether the client's certificate is checked.
+  /// Whether the client is asked for a certificate.
   Verify(VerifyMode)
   /// With `VerifyPeer`, reject a client that sends no certificate.
   FailWithoutPeerCertificate(Bool)
   /// How many intermediate certificates a chain may have.
   Depth(Int)
-  /// Whether a checked certificate is also tested against a revocation list.
+  /// Whether a verified certificate is also checked against a revocation list.
   CrlCheck(CrlMode)
   /// The protocol versions the server accepts.
   Versions(List(TlsVersion))
-  /// The groups the key exchange may use, most preferred first. TLS 1.3 and
-  /// the TLS 1.2 elliptic curve exchanges.
+  /// The groups the key exchange may use, most preferred first. Applies to
+  /// TLS 1.3 and to the TLS 1.2 elliptic curve exchanges.
   SupportedGroups(List(KeyExchangeGroup))
-  /// The protocols the server picks from the client's list, most preferred
-  /// first.
+  /// The protocols the server picks from the client's ALPN list, most
+  /// preferred first.
   AlpnPreferredProtocols(List(BitArray))
-  /// Prefer the server's cipher order to the client's.
+  /// Use the server's cipher order rather than the client's.
   HonorCipherOrder(Bool)
   /// Allow TLS 1.2 session resumption.
   ReuseSessions(Bool)
   /// Refuse to renegotiate with a peer that does not support
-  /// [RFC 5746](https://www.rfc-editor.org/rfc/rfc5746). TLS 1.2 and below,
-  /// where renegotiation exists.
+  /// [RFC 5746](https://www.rfc-editor.org/rfc/rfc5746). TLS 1.2 only,
+  /// since 1.3 has no renegotiation.
   SecureRenegotiate(Bool)
-  /// Whether a client may ask to renegotiate. TLS 1.2 and below.
+  /// Whether the client may ask to renegotiate. TLS 1.2 only.
   ClientRenegotiation(Bool)
-  /// The TLS 1.3 session resumption offered.
+  /// Which TLS 1.3 session resumption to offer.
   SessionTickets(TicketMode)
   /// A PEM file of Diffie-Hellman parameters.
   DiffieHellmanFile(String)
@@ -499,7 +501,8 @@ pub type TlsOption {
   Logging(LogLevel)
 }
 
-/// A message delivered to a socket's owner while the socket is not `Passive`.
+/// What a non-`Passive` socket delivers to its owner. Build a selector for
+/// them with `selector`.
 pub type Message {
   /// Data received.
   Incoming(BitArray)
@@ -507,11 +510,11 @@ pub type Message {
   Disconnected
   /// The connection failed and is now closed.
   Failed(reason: SocketError)
-  /// The socket is passive again.
+  /// The socket has gone back to `Passive`.
   Exhausted
 }
 
-/// Describe a `SocketError` as a lower case clause.
+/// A `SocketError` as a lower case phrase that reads after a colon.
 ///
 /// ```gleam
 /// "Could not open the listen socket: " <> error_to_string(error)
@@ -578,7 +581,7 @@ pub fn error_to_string(error: SocketError) -> String {
   }
 }
 
-/// Describe an `AlertDescription` as a lower case clause.
+/// An `AlertDescription` as a lower case phrase that reads after a colon.
 pub fn alert_description_to_string(description: AlertDescription) -> String {
   case description {
     CloseNotify -> "the sender is closing the connection cleanly"
@@ -618,7 +621,7 @@ pub fn alert_description_to_string(description: AlertDescription) -> String {
   }
 }
 
-/// Describe a `PemError` as a lower case clause.
+/// A `PemError` as a lower case phrase that reads after a colon.
 pub fn pem_error_to_string(error: PemError) -> String {
   case error {
     NoPrivateKey -> "the bytes hold no private key"
@@ -628,17 +631,18 @@ pub fn pem_error_to_string(error: PemError) -> String {
   }
 }
 
-/// An address as text. Follows [RFC 5952](https://www.rfc-editor.org/rfc/rfc5952): 
-/// lower case hex with the longest run of zero groups compressed, an IPv4 
-/// mapped address in its mixed form such as `::ffff:192.0.2.1`.
+/// An address as text, following
+/// [RFC 5952](https://www.rfc-editor.org/rfc/rfc5952): the lower case hex, the
+/// longest run of zero groups collapsed to `::` and IPv4 mapped addresses in
+/// their mixed form such as `::ffff:192.0.2.1`.
 ///
 /// [`inet:ntoa/1`](https://www.erlang.org/doc/apps/kernel/inet.html#ntoa/1)
 @external(erlang, "tup_socket_ffi", "ip_address_to_string")
 pub fn ip_address_to_string(address: IpAddress) -> String
 
-/// An endpoint as text. An abstract Unix address whose path starts with a NUL 
-/// byte is written with a leading `@` the way. An unnamed Unix endpoint is an 
-/// empty string.
+/// An endpoint as text. IPv6 addresses are bracketed. An abstract Unix socket 
+/// whose path starts with a NUL byte is written with a leading `@`. An unnamed 
+/// Unix endpoint is the empty string.
 pub fn endpoint_to_string(endpoint: Endpoint) -> String {
   case endpoint {
     TcpEndpoint(ip_address: Ipv4(..) as address, port:) ->
@@ -650,7 +654,8 @@ pub fn endpoint_to_string(endpoint: Endpoint) -> String {
   }
 }
 
-/// A selector for the messages of a socket on this transport.
+/// A selector for the messages of a socket on this transport. Merge it into
+/// the selector of the process that owns a non-`Passive` socket.
 pub fn selector(transport: Transport) -> process.Selector(Message) {
   let #(incoming, closed, failed, exhausted) = case transport {
     Tcp -> #("tcp", "tcp_closed", "tcp_error", "tcp_passive")
@@ -664,8 +669,9 @@ pub fn selector(transport: Transport) -> process.Selector(Message) {
   |> process.select_record(atom.create(exhausted), 1, to_message)
 }
 
-/// Open a listen socket bound to `port` or to a port the system picks when
-/// `port` is `0`. The socket belongs to the calling process.
+/// Open a TCP listen socket on `port` or on a port the system picks when
+/// `port` is `0`. The socket belongs to the calling process and closes when
+/// that process exits.
 ///
 /// [`gen_tcp:listen/2`](https://www.erlang.org/doc/apps/kernel/gen_tcp.html#listen/2)
 pub fn listen(
@@ -676,8 +682,7 @@ pub fn listen(
   |> result.map(fn(socket) { #(Tcp, socket) })
 }
 
-/// Open a TLS listen socket bound to `port` or to a port the system picks
-/// when `port` is `0`. The socket belongs to the calling process.
+/// `listen` over TLS. A rejected TLS option fails as `BadTlsOption`.
 ///
 /// [`ssl:listen/2`](https://www.erlang.org/doc/apps/ssl/ssl.html#listen/2)
 pub fn listen_tls(
@@ -689,9 +694,9 @@ pub fn listen_tls(
   |> result.map(fn(socket) { #(Ssl, socket) })
 }
 
-/// Wait for the next connection, blocking the calling process. On `Ssl` only
-/// the TCP connection is accepted and the socket carries no data until the
-/// handshake has run.
+/// Wait for the next connection. On `Ssl` this accepts only the TCP
+/// connection and the socket carries no data until `handshake` has run which 
+/// leaves room to hand the socket to another process first.
 ///
 /// [`gen_tcp:accept/2`](https://www.erlang.org/doc/apps/kernel/gen_tcp.html#accept/2),
 /// [`ssl:transport_accept/2`](https://www.erlang.org/doc/apps/ssl/ssl.html#transport_accept/2)
@@ -706,8 +711,9 @@ pub fn accept(
   }
 }
 
-/// Run the TLS handshake on an accepted socket, returning the socket to use
-/// from then on. Does nothing on `Tcp`.
+/// Run the TLS handshake on an accepted socket. Use the socket it returns
+/// from then on as the one passed in is consumed. On `Tcp` the socket is
+/// returned unchanged so this function is safe to call on every transport.
 ///
 /// [`ssl:handshake/2`](https://www.erlang.org/doc/apps/ssl/ssl.html#handshake/2)
 pub fn handshake(
@@ -721,9 +727,9 @@ pub fn handshake(
   }
 }
 
-/// Hand a socket to another process which then receives its messages and may
-/// send on it. The caller has to own the socket and messages already delivered 
-/// stay in its mailbox.
+/// Make `pid` the owner of the socket. Only the current owner may do this.
+/// Messages already delivered stay in the caller's mailbox so transfer
+/// before taking the socket out of `Passive`.
 ///
 /// [`gen_tcp:controlling_process/2`](https://www.erlang.org/doc/apps/kernel/gen_tcp.html#controlling_process/2),
 /// [`ssl:controlling_process/2`](https://www.erlang.org/doc/apps/ssl/ssl.html#controlling_process/2)
@@ -738,7 +744,8 @@ pub fn controlling_process(
   }
 }
 
-/// Close a connection.
+/// Close a connection. Unsent data is flushed or dropped according to
+/// `Linger`.
 ///
 /// [`gen_tcp:close/1`](https://www.erlang.org/doc/apps/kernel/gen_tcp.html#close/1),
 /// [`ssl:close/1`](https://www.erlang.org/doc/apps/ssl/ssl.html#close/1)
@@ -749,8 +756,8 @@ pub fn close(transport: Transport, socket: Socket) -> Result(Nil, SocketError) {
   }
 }
 
-/// Close a listen socket releasing the port. Every waiting accept then fails
-/// with `Closed`.
+/// Close a listen socket and release its port. Every `accept` blocked on it
+/// returns `Closed`.
 ///
 /// [`gen_tcp:close/1`](https://www.erlang.org/doc/apps/kernel/gen_tcp.html#close/1),
 /// [`ssl:close/1`](https://www.erlang.org/doc/apps/ssl/ssl.html#close/1)
@@ -794,8 +801,8 @@ pub fn send(
   }
 }
 
-/// Read from a `Passive` socket. `bytes` is how much to wait for, `0` for
-/// whatever has arrived.
+/// Read from a `Passive` socket. Blocking until `bytes` bytes have arrived or
+/// `timeout` runs out. `0` takes whatever is there.
 ///
 /// [`gen_tcp:recv/3`](https://www.erlang.org/doc/apps/kernel/gen_tcp.html#recv/3),
 /// [`ssl:recv/3`](https://www.erlang.org/doc/apps/ssl/ssl.html#recv/3)
@@ -811,7 +818,7 @@ pub fn receive(
   }
 }
 
-/// Change the options of an open connection. Listen only options are rejected
+/// Change the options of an open connection. Listen only options are rejected 
 /// with `Einval`.
 ///
 /// [`inet:setopts/2`](https://www.erlang.org/doc/apps/kernel/inet.html#setopts/2),
@@ -827,7 +834,7 @@ pub fn set_options(
   }
 }
 
-/// The address and port at this end of a connection.
+/// The local address and port of a connection.
 ///
 /// [`inet:sockname/1`](https://www.erlang.org/doc/apps/kernel/inet.html#sockname/1),
 /// [`ssl:sockname/1`](https://www.erlang.org/doc/apps/ssl/ssl.html#sockname/1)
@@ -841,7 +848,8 @@ pub fn sockname(
   }
 }
 
-/// The address and port a listen socket is bound to.
+/// The address and port a listen socket is bound to. This is how to learn
+/// the port after listening on `0`.
 ///
 /// [`inet:sockname/1`](https://www.erlang.org/doc/apps/kernel/inet.html#sockname/1),
 /// [`ssl:sockname/1`](https://www.erlang.org/doc/apps/ssl/ssl.html#sockname/1)
@@ -855,7 +863,7 @@ pub fn sockname_listener(
   }
 }
 
-/// The address and port at the other end of a connection.
+/// The address and port of the peer.
 ///
 /// [`inet:peername/1`](https://www.erlang.org/doc/apps/kernel/inet.html#peername/1),
 /// [`ssl:peername/1`](https://www.erlang.org/doc/apps/ssl/ssl.html#peername/1)
@@ -869,8 +877,8 @@ pub fn peername(
   }
 }
 
-/// The protocol agreed through ALPN, such as `<<"h2">>`. `NotNegotiated` when
-/// none was agreed, `Unsupported` on `Tcp`.
+/// The protocol agreed through ALPN. Returns `NotNegotiated` when none was 
+/// agreed and `Unsupported` on `Tcp`.
 ///
 /// [`ssl:negotiated_protocol/1`](https://www.erlang.org/doc/apps/ssl/ssl.html#negotiated_protocol/1)
 pub fn negotiated_protocol(
@@ -883,8 +891,9 @@ pub fn negotiated_protocol(
   }
 }
 
-/// The peer's DER encoded certificate, which requires `Verify(VerifyPeer)`.
-/// `NoPeerCertificate` when the peer sent none, `Unsupported` on `Tcp`.
+/// The peer's DER certificate. Only present when the listener asked for one
+/// with `Verify(VerifyPeer)`. Returns `NoPeerCertificate` otherwise and 
+/// `Unsupported` on `Tcp`.
 ///
 /// [`ssl:peercert/1`](https://www.erlang.org/doc/apps/ssl/ssl.html#peercert/1)
 pub fn peer_certificate(
@@ -897,15 +906,15 @@ pub fn peer_certificate(
   }
 }
 
-/// Every certificate a PEM file holds, in the order it holds them, as the
-/// DER `CertificateChain` and `CertificateAuthorities` take. Entries that are
-/// not certificates are skipped.
+/// Every certificate in a PEM file. Entries that are not certificates are 
+/// skipped.
 ///
 /// [`public_key:pem_decode/1`](https://www.erlang.org/doc/apps/public_key/public_key.html#pem_decode/1)
 @external(erlang, "tup_socket_ffi", "certificates_from_pem")
 pub fn certificates_from_pem(pem: BitArray) -> List(BitArray)
 
-/// The first private key a PEM file holds as the DER `CertificateChain` takes.
+/// The first private key in a PEM file. `password` is needed when the key is 
+/// encrypted.
 ///
 /// [`public_key:pem_decode/1`](https://www.erlang.org/doc/apps/public_key/public_key.html#pem_decode/1)
 @external(erlang, "tup_socket_ffi", "private_key_from_pem")
@@ -914,9 +923,8 @@ pub fn private_key_from_pem(
   password: option.Option(String),
 ) -> Result(PrivateKey, PemError)
 
-/// The DER certificates of the authorities the operating system trusts as
-/// `CertificateAuthorities` takes them. Raises when the host has no trust
-/// store to read.
+/// The certificates the operating system trusts. Raises when the host has no 
+/// trust store to read.
 ///
 /// [`public_key:cacerts_get/0`](https://www.erlang.org/doc/apps/public_key/public_key.html#cacerts_get/0)
 @external(erlang, "tup_socket_ffi", "system_certificate_authorities")
