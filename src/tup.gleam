@@ -219,6 +219,7 @@ pub opaque type Builder(user_state, user_message) {
     active_state: socket.ActiveState,
     pool_size: Int,
     shutdown_timeout: ShutdownTimeout,
+    buffer_size: option.Option(Int),
     handlers: connection.Handlers(user_state, user_message),
     name: option.Option(process.Name(Server)),
   )
@@ -237,6 +238,7 @@ pub fn new(
     active_state: socket.Once,
     pool_size: 20,
     shutdown_timeout: ShutdownAfter(15_000),
+    buffer_size: option.None,
     handlers: connection.Handlers(
       on_init: fn(connection, selector) {
         let connection = from_internal_connection(connection)
@@ -275,6 +277,16 @@ pub fn shutdown_timeout(
 /// ever completing, so only use this when every handler is sure to return.
 pub fn infinite_shutdown_timeout(builder: Builder(user_state, user_message)) {
   Builder(..builder, shutdown_timeout: ShutdownNever)
+}
+
+/// The most bytes one read hands to your handler. Erlang's default is about 
+/// 9 KB.
+///
+/// A larger buffer means fewer and bigger `Incoming` messages, which pays off 
+/// when clients send a lot of data. It costs the memory on every connection
+/// so provide careful values.
+pub fn buffer_size(builder: Builder(user_state, user_message), bytes: Int) {
+  Builder(..builder, buffer_size: option.Some(bytes))
 }
 
 pub fn on_shutdown(
@@ -515,12 +527,14 @@ pub fn start(builder: Builder(user_state, user_message)) {
     active_state:,
     pool_size:,
     shutdown_timeout:,
+    buffer_size:,
     handlers:,
     name:,
   ) = builder
 
   use pool_size <- try_pool_size(pool_size)
   use shutdown_timeout <- try_shutdown_timeout(shutdown_timeout)
+  use buffer_size <- try_buffer_size(buffer_size)
 
   use address <- result.try(case address {
     Tcp(interface:, port:) -> {
@@ -535,7 +549,7 @@ pub fn start(builder: Builder(user_state, user_message)) {
   })
   use tls <- try_tls(tls)
 
-  let listener_argument = listener.Argument(address:, tls:)
+  let listener_argument = listener.Argument(address:, tls:, buffer_size:)
   let pool_argument = pool.Argument(pool_size:, active_state:, handlers:)
 
   use <- try_name(name)
@@ -615,6 +629,17 @@ pub fn start(builder: Builder(user_state, user_message)) {
     |> pool.add_child(listener_argument, pool_argument)
   })
   |> relay.start
+}
+
+fn try_buffer_size(
+  buffer_size: option.Option(Int),
+  callback: fn(option.Option(Int)) -> Result(a, actor.StartError),
+) -> Result(a, actor.StartError) {
+  case buffer_size {
+    option.Some(bytes) if bytes <= 0 ->
+      Error(actor.InitFailed("Provided buffer size is negative or equals to 0."))
+    buffer_size -> callback(buffer_size)
+  }
 }
 
 fn try_shutdown_timeout(

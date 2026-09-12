@@ -235,19 +235,16 @@ pub fn start_worker(argument: Argument(user_state, user_message)) {
         actor.continue(state)
       }
 
-      Acknowledged(connection:, active_state:, handlers:, user_state:, ..),
+      Acknowledged(connection:, handlers:, user_state:, ..),
         Received(socket.Incoming(data))
       -> {
-        let Connection(transport:, socket:, ..) = connection
-        use <- bump_flow_control(transport, socket, active_state)
-
         let rescued =
           exception.rescue(fn() {
             handlers.handler(connection, user_state, Incoming(data))
           })
 
         case rescued {
-          Ok(next) -> handle_next(state, next)
+          Ok(next) -> handle_next(state, next, consumed_packet: True)
           Error(exception) -> {
             run_on_close(handlers, user_state)
 
@@ -289,7 +286,7 @@ pub fn start_worker(argument: Argument(user_state, user_message)) {
           })
 
         case rescued {
-          Ok(next) -> handle_next(state, next)
+          Ok(next) -> handle_next(state, next, consumed_packet: False)
           Error(exception) -> {
             run_on_close(handlers, user_state)
 
@@ -351,16 +348,16 @@ fn exit_reason_to_dynamic(reason: process.ExitReason) -> dynamic.Dynamic {
   }
 }
 
-fn bump_flow_control(
+fn rearm_flow_control(
   transport: socket.Transport,
   socket: socket.Socket,
-  active_state: socket.ActiveState,
+  active_state: option.Option(socket.ActiveState),
   callback: fn() -> actor.Next(a, b),
-) {
+) -> actor.Next(a, b) {
   case active_state {
-    socket.Once ->
+    option.Some(active_state) ->
       refresh_flow_control(transport, socket, active_state, callback)
-    socket.Always | socket.Passive | socket.Packets(..) -> callback()
+    option.None -> callback()
   }
 }
 
@@ -388,17 +385,31 @@ fn refresh_flow_control(
 fn handle_next(
   state: State(user_state, user_message),
   next: Next(user_state, user_message),
+  consumed_packet consumed_packet: Bool,
 ) {
   case state, next {
-    Acknowledged(init_selector: selector, ..) as state,
-      Continue(state: user_state, selector: user_selector, active_state:)
+    Acknowledged(
+      connection: Connection(transport:, socket:, ..),
+      init_selector: selector,
+      active_state: current,
+      ..,
+    ) as state,
+      Continue(state: user_state, selector: user_selector, active_state: asked)
     -> {
-      let state = case active_state {
-        option.Some(active_state) ->
-          Acknowledged(..state, user_state: user_state, active_state:)
-        option.None -> Acknowledged(..state, user_state: user_state)
+      let rearm = case asked, consumed_packet, current {
+        option.Some(active_state), _consumed, _current ->
+          option.Some(active_state)
+        option.None, True, socket.Once -> option.Some(socket.Once)
+        option.None, _consumed, _current -> option.None
       }
+      let state =
+        Acknowledged(
+          ..state,
+          user_state:,
+          active_state: option.unwrap(asked, current),
+        )
 
+      use <- rearm_flow_control(transport, socket, rearm)
       let next = actor.continue(state)
       case user_selector {
         option.Some(user_selector) -> {
@@ -461,9 +472,8 @@ fn run_on_close(
 }
 
 /// Describe an exception raised by user code in a way the actual error reaches 
-/// the log or exit reason.
-/// The runtime error Gleam raises for `panic`, `todo`, `let assert` and
-/// `assert`.
+/// the log or exit reason. The runtime error Gleam raises for `panic`, `todo`, 
+/// `let assert` and `assert`.
 type GleamError {
   GleamError(
     kind: GleamErrorKind,
@@ -472,7 +482,7 @@ type GleamError {
     function: String,
     file: String,
     line: Int,
-    /// The value that did not match, for `let assert`.
+    /// The value that did not match for `let assert`.
     value: option.Option(dynamic.Dynamic),
   )
 }

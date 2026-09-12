@@ -9,7 +9,11 @@ import tup/internals/file
 import tup/socket
 
 pub type Argument {
-  Argument(address: Address, tls: option.Option(List(socket.TlsOption)))
+  Argument(
+    address: Address,
+    tls: option.Option(List(socket.TlsOption)),
+    buffer_size: option.Option(Int),
+  )
 }
 
 pub type Relayed {
@@ -52,7 +56,12 @@ fn start(argument: Argument) {
       socket.ReuseAddress(True),
       socket.SendTimeoutClose(True),
       socket.Backlog(1024),
+      socket.NoDelay(True),
     ]
+    let tcp_options = case argument.buffer_size {
+      option.Some(bytes) -> [socket.Buffer(bytes), ..tcp_options]
+      option.None -> tcp_options
+    }
 
     let listen = case argument.tls {
       option.Some(tls_options) ->
